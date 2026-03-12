@@ -9,6 +9,8 @@ mod checkpoint;
 mod backward;
 mod data;
 mod gpu;
+mod gpu_backend;
+mod gpu_persistent;
 mod grad_test;
 mod init;
 mod model;
@@ -36,6 +38,31 @@ fn main() {
         Some("gpu-test") => {
             // Stage 1: GPU kernel validation
             gpu_kernel_test();
+        }
+        Some("gpu-backend-test") => {
+            // GPU backend validation: all primitives against CPU
+            gpu_backend::validate_gpu_backend();
+        }
+        Some("gpu-bench") => {
+            // GPU vs CPU benchmark: per-primitive timing comparison
+            gpu_backend::benchmark_gpu_vs_cpu();
+        }
+        Some("gpu-persistent-bench") => {
+            // Persistent GPU pipeline: data stays on device, single submit
+            gpu_persistent::benchmark_persistent();
+        }
+        Some("backend-select") => {
+            // Test auto-selection at various dimensions
+            println!("Backend auto-selection test\n");
+            for dim in [128, 256, 512, 768, 1024] {
+                print!("  dim={dim}: ");
+                let _ = backend::auto_select(dim, false, false);
+            }
+            println!();
+            print!("  dim=128 --force-gpu: ");
+            let _ = backend::auto_select(128, false, true);
+            print!("  dim=1024 --force-cpu: ");
+            let _ = backend::auto_select(1024, true, false);
         }
         Some("grad-test") => {
             // Stage 3: gradient validation
@@ -79,6 +106,7 @@ fn main() {
         _ => {
             println!("Usage:");
             println!("  kerr-engine gpu-test              Stage 1: GPU kernel validation");
+            println!("  kerr-engine gpu-backend-test      GPU backend: validate all primitives vs CPU");
             println!("  kerr-engine validate <model.bin>  Stage 2: full forward pass validation");
             println!("  kerr-engine grad-test [test.bin]  Stage 3: gradient validation");
             println!("  kerr-engine train [data] [iters] [batch] [seq_len] [lr] [--no-curriculum] [--word] [--resume FILE]");

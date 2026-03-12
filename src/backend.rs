@@ -1,11 +1,68 @@
 //! Compute backend trait — abstraction over CPU/GPU execution.
 //!
-//! Defines the interface that both CpuBackend and (future) GpuBackend
-//! implement. The training loop and inference call through this trait.
-//! Today: one implementation (CPU). The trait exists so GPU training
-//! slots in without restructuring.
+//! Defines the interface that both CpuBackend and GpuBackend implement.
+//! The training loop and inference call through this trait.
+//! Auto-selection: CPU below crossover dim, GPU above (if available).
 
 use crate::model::*;
+
+/// GPU dispatch overhead crossover point (measured on RTX 4070 Ti, 2026-03-12).
+/// Below this: CPU wins. Above this: GPU persistent pipeline wins.
+/// Derived from benchmark: CPU linear O(n^2) crosses ~120us GPU dispatch overhead.
+const GPU_CROSSOVER_DIM: usize = 768;
+
+/// Auto-select the best backend for the given embedding dimension.
+/// Returns a boxed trait object so the caller doesn't know which backend it got.
+///
+/// Rules:
+/// - N_EMBD < GPU_CROSSOVER_DIM → CpuBackend (dispatch overhead exceeds compute)
+/// - N_EMBD >= GPU_CROSSOVER_DIM and GPU available → GpuBackend
+/// - N_EMBD >= GPU_CROSSOVER_DIM but no GPU → CpuBackend (fallback)
+/// - --force-cpu / --force-gpu override auto-selection
+pub fn auto_select(n_embd: usize, force_cpu: bool, force_gpu: bool) -> Box<dyn ComputeBackend + Send + Sync> {
+    if force_cpu {
+        println!("  Backend: CPU (forced)");
+        return Box::new(CpuBackend);
+    }
+
+    if force_gpu || n_embd >= GPU_CROSSOVER_DIM {
+        match try_gpu_backend() {
+            Some(gpu) => {
+                println!("  Backend: GPU (n_embd={n_embd} >= {GPU_CROSSOVER_DIM} crossover)");
+                return Box::new(gpu);
+            }
+            None => {
+                if force_gpu {
+                    println!("  Backend: CPU (GPU requested but unavailable)");
+                } else {
+                    println!("  Backend: CPU (no GPU detected, fallback)");
+                }
+                return Box::new(CpuBackend);
+            }
+        }
+    }
+
+    println!("  Backend: CPU (n_embd={n_embd} < {GPU_CROSSOVER_DIM} crossover)");
+    Box::new(CpuBackend)
+}
+
+/// Try to initialize GPU backend. Returns None if no GPU available.
+fn try_gpu_backend() -> Option<crate::gpu_backend::GpuBackend> {
+    let instance = wgpu::Instance::default();
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        ..Default::default()
+    }))?;
+
+    let name = adapter.get_info().name;
+    let backend = adapter.get_info().backend;
+    println!("  GPU: {name} ({backend:?})");
+
+    // GPU exists — let GpuBackend::new() handle the full init
+    // Note: GpuBackend::new() also prints adapter info; suppress by using from_existing
+    // when that's implemented. For now, the double-print is harmless.
+    Some(crate::gpu_backend::GpuBackend::new())
+}
 
 /// Core compute operations that can run on CPU or GPU.
 pub trait ComputeBackend {
