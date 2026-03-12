@@ -3,6 +3,7 @@
 //! Stage 1: Single Euler step GPU validation (COMPLETE)
 //! Stage 2: Full forward pass, load Python weights, validate against Python logits.
 
+#[allow(dead_code)]
 mod backend;
 mod backward;
 mod data;

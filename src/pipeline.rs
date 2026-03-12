@@ -106,6 +106,7 @@ pub struct ForwardCache {
     pub logits: Vec<Vec<f32>>,
 }
 
+#[allow(dead_code)]
 pub struct BlockCache {
     pub input: Vec<Vec<f32>>,
     pub normed_1: Vec<Vec<f32>>,

@@ -140,7 +140,6 @@ pub fn softplus_backward(d_y: f32, x: f32) -> f32 {
 /// Backward through cross-entropy loss with logits.
 /// Returns d_logits = softmax(logits) - one_hot(target)
 pub fn cross_entropy_backward(logits: &[f32], target: usize) -> Vec<f32> {
-    let n = logits.len();
     let max_l = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
 
     let exp_l: Vec<f32> = logits.iter().map(|&l| (l - max_l).exp()).collect();
@@ -326,8 +325,8 @@ pub fn rk4_step_backward(
 
     // r4 = r + dt*dr3, so d_r += d_r4, d_dr3 += d_r4 * dt
     for k in 0..n { d_r[k] += d_r4[k]; d_s[k] += d_s4[k]; }
-    let mut d_dr3: Vec<f32> = (0..n).map(|k| d_r4[k] * dt + d_r_new[k] * dt6 * 2.0).collect();
-    let mut d_ds3: Vec<f32> = (0..n).map(|k| d_s4[k] * dt + d_s_new[k] * dt6 * 2.0).collect();
+    let d_dr3: Vec<f32> = (0..n).map(|k| d_r4[k] * dt + d_r_new[k] * dt6 * 2.0).collect();
+    let d_ds3: Vec<f32> = (0..n).map(|k| d_s4[k] * dt + d_s_new[k] * dt6 * 2.0).collect();
 
     // Backward through k3 = f(r3, s3)
     let (d_r3, d_s3, dg, dom, da, db) =
@@ -529,13 +528,3 @@ pub struct LinearGrads {
     pub d_b: Vec<f32>,
 }
 
-// ─── Utility for model.rs ───────────────────────────────────────
-
-/// Helper to call linear from model.rs (avoiding circular dependency)
-impl crate::model::ModelWeights {
-    /// Placeholder: full backward pass will be assembled here.
-    pub fn backward_placeholder(&self) {
-        // Stage 3 validation: test individual gradient components
-        // against PyTorch finite differences
-    }
-}

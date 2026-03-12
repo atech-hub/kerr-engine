@@ -76,7 +76,7 @@ pub fn validate_gradients(test_path: &str) {
 
     // Run Rust backward for derivative
     // First, forward to build cache
-    let (dr, ds, cache) = crate::backward::kerr_derivative_with_cache_pub(
+    let (_dr, _ds, cache) = crate::backward::kerr_derivative_with_cache_pub(
         &py_r, &py_s, &gamma, &py_omega, py_alpha, py_beta,
     );
 
