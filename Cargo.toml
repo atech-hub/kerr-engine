@@ -1,0 +1,16 @@
+[workspace]
+members = ["kernels/kerr-ode"]
+resolver = "2"
+
+[package]
+name = "kerr-engine"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+wgpu = "24"
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "0.4"
+
+[build-dependencies]
+spirv-builder = { git = "https://github.com/Rust-GPU/rust-gpu", default-features = false, features = ["use-installed-tools"] }
