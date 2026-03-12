@@ -2,8 +2,10 @@
 //!
 //! The forward/backward pipeline lives in pipeline.rs.
 //! The optimizer lives in optim.rs. Data in data.rs.
+//! Checkpoint save/load in checkpoint.rs.
 
 use crate::model::*;
+use crate::checkpoint;
 use crate::data::Dataset;
 use crate::init::init_model;
 use crate::optim::{self, Adam};
@@ -63,58 +65,84 @@ impl CurriculumSchedule {
     }
 }
 
+// ─── Training config ─────────────────────────────────────────
+
+pub struct TrainConfig {
+    pub data_path: String,
+    pub n_iters: usize,
+    pub batch_size: usize,
+    pub seq_len: usize,
+    pub lr: f32,
+    pub use_curriculum: bool,
+    pub resume_path: Option<String>,
+    pub checkpoint_every: usize,
+}
+
 // ─── Training loop ────────────────────────────────────────────
 
-pub fn train(data_path: &str, n_iters: usize, batch_size: usize, seq_len: usize, lr: f32, use_curriculum: bool) {
+pub fn train_with_config(config: TrainConfig) {
     println!("Stage 4 — training from scratch\n");
 
     // Load dataset
-    println!("Loading dataset from {data_path}...");
-    let dataset = Dataset::from_file(data_path);
+    println!("Loading dataset from {}...", config.data_path);
+    let dataset = Dataset::from_file(&config.data_path);
 
-    // Init model
-    println!("Initializing model...");
-    let mut model = init_model(dataset.vocab_size, 42);
-    let n_params = optim::count_params(&model);
-    println!("  Trainable parameters: {}", n_params);
-
-    // Init Adam
-    let mut optimizer = Adam::new(lr, n_params);
+    // Init or resume
+    let (mut model, mut optimizer, mut rng, start_iter) = if let Some(ref path) = config.resume_path {
+        println!("Resuming from checkpoint: {path}");
+        let state = checkpoint::load(path).expect("Failed to load checkpoint");
+        println!("  Resumed at iteration {}", state.iter);
+        let rng = state.rng;
+        (state.model, state.optimizer, rng, state.iter)
+    } else {
+        println!("Initializing model...");
+        let model = init_model(dataset.vocab_size, 42);
+        let n_params = optim::count_params(&model);
+        println!("  Trainable parameters: {}", n_params);
+        let optimizer = Adam::new(config.lr, n_params);
+        let rng = Rng::new(1337);
+        (model, optimizer, rng, 0)
+    };
 
     // Detect thread count
     let n_threads = thread::available_parallelism()
-        .map(|n| n.get().min(batch_size))
+        .map(|n| n.get().min(config.batch_size))
         .unwrap_or(1);
 
+    let n_params = optim::count_params(&model);
+
     // Curriculum schedule
-    let curriculum = if use_curriculum {
+    let curriculum = if config.use_curriculum {
         CurriculumSchedule::default_3stage()
     } else {
         CurriculumSchedule::none()
     };
     print!("  Curriculum: ");
-    curriculum.describe(n_iters);
+    curriculum.describe(config.n_iters);
 
     // Training
-    println!("\nTraining for {n_iters} iterations (batch_size={batch_size}, seq_len={seq_len}, lr={lr}, threads={n_threads})");
+    println!("\nTraining for {} iterations (batch_size={}, seq_len={}, lr={}, threads={})",
+        config.n_iters, config.batch_size, config.seq_len, config.lr, n_threads);
+    if start_iter > 0 {
+        println!("  Resuming from iteration {start_iter}");
+    }
     println!("{:>6} {:>10} {:>6} {:>10}", "Iter", "Loss", "Bands", "Time");
     println!("{}", "-".repeat(40));
 
-    let mut rng = Rng::new(1337);
     let log_every = 50;
     let eval_every = 300;
 
     let train_start = std::time::Instant::now();
 
-    for iter in 0..n_iters {
+    for iter in start_iter..config.n_iters {
         let iter_start = std::time::Instant::now();
-        let active_bands = curriculum.active_bands(iter, n_iters);
+        let active_bands = curriculum.active_bands(iter, config.n_iters);
 
-        let (inputs, targets) = dataset.sample_batch(&mut rng, batch_size, seq_len);
+        let (inputs, targets) = dataset.sample_batch(&mut rng, config.batch_size, config.seq_len);
 
         // Parallel forward+backward across batch elements
         let batch_results: Vec<(f32, Vec<f32>)> = thread::scope(|s| {
-            let handles: Vec<_> = (0..batch_size).map(|b| {
+            let handles: Vec<_> = (0..config.batch_size).map(|b| {
                 let model_ref = &model;
                 let input_ref = &inputs[b];
                 let target_ref = &targets[b];
@@ -139,8 +167,8 @@ pub fn train(data_path: &str, n_iters: usize, batch_size: usize, seq_len: usize,
         }
 
         // Average over batch
-        total_loss /= batch_size as f32;
-        for g in grads.iter_mut() { *g /= batch_size as f32; }
+        total_loss /= config.batch_size as f32;
+        for g in grads.iter_mut() { *g /= config.batch_size as f32; }
 
         // Gradient clipping
         optim::clip_grad_norm(&mut grads, 1.0);
@@ -152,7 +180,7 @@ pub fn train(data_path: &str, n_iters: usize, batch_size: usize, seq_len: usize,
 
         let iter_time = iter_start.elapsed();
 
-        if iter % log_every == 0 || iter == n_iters - 1 {
+        if iter % log_every == 0 || iter == config.n_iters - 1 {
             println!("{:>6} {:>10.4} {:>6} {:>10.1?}", iter, total_loss, active_bands, iter_time);
         }
 
@@ -163,10 +191,26 @@ pub fn train(data_path: &str, n_iters: usize, batch_size: usize, seq_len: usize,
             println!("{sample}");
             println!("---\n");
         }
+
+        // Checkpoint
+        if config.checkpoint_every > 0 && iter > 0 && iter % config.checkpoint_every == 0 {
+            let path = format!("checkpoint_iter{iter}.bin");
+            match checkpoint::save(&path, &model, &optimizer, &rng, iter + 1, config.lr) {
+                Ok(()) => println!("  [checkpoint saved: {path}]"),
+                Err(e) => println!("  [checkpoint failed: {e}]"),
+            }
+        }
     }
 
     let total_time = train_start.elapsed();
     println!("\nTraining complete. Total time: {total_time:.1?}");
+
+    // Save final checkpoint
+    let path = format!("checkpoint_final.bin");
+    match checkpoint::save(&path, &model, &optimizer, &rng, config.n_iters, config.lr) {
+        Ok(()) => println!("  [final checkpoint saved: {path}]"),
+        Err(e) => println!("  [final checkpoint failed: {e}]"),
+    }
 
     // Final generation
     let sample = generate(&model, &dataset, 500, &mut rng);

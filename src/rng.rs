@@ -11,6 +11,16 @@ impl Rng {
         Self { state: seed }
     }
 
+    /// Get current state for checkpointing.
+    pub fn state(&self) -> u64 {
+        self.state
+    }
+
+    /// Restore from checkpointed state.
+    pub fn from_state(state: u64) -> Self {
+        Self { state }
+    }
+
     pub fn next_u64(&mut self) -> u64 {
         self.state ^= self.state << 13;
         self.state ^= self.state >> 7;

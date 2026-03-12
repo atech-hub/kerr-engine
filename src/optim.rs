@@ -29,6 +29,24 @@ impl Adam {
         }
     }
 
+    /// Restore from checkpoint.
+    pub fn from_checkpoint(lr: f32, t: usize, m: Vec<f32>, v: Vec<f32>) -> Self {
+        Self {
+            lr,
+            beta1: 0.9,
+            beta2: 0.999,
+            eps: 1e-8,
+            t,
+            m,
+            v,
+        }
+    }
+
+    /// Get state for checkpointing.
+    pub fn checkpoint_state(&self) -> (usize, &[f32], &[f32]) {
+        (self.t, &self.m, &self.v)
+    }
+
     /// Step: update params in-place given gradients.
     pub fn step(&mut self, params: &mut [f32], grads: &[f32]) {
         self.t += 1;
@@ -56,6 +74,35 @@ pub fn clip_grad_norm(grads: &mut [f32], max_norm: f32) {
 }
 
 // ─── Parameter count ──────────────────────────────────────────
+
+/// Count params from vocab_size alone (architecture is fixed).
+pub fn count_params_for_vocab(vocab_size: usize) -> usize {
+    let mut n = 0;
+
+    // Block 0: PerBandLinear
+    n += N_EMBD * 2; // ln_1
+    n += 3 * N_EMBD * N_EMBD + 3 * N_EMBD; // c_attn
+    n += N_EMBD * N_EMBD + N_EMBD; // c_proj
+    n += N_EMBD * 2; // ln_2
+    n += N_BANDS * 4 + N_BANDS * 2; // band_w + band_b
+    n += N_EMBD * N_EMBD + N_EMBD; // out_proj
+
+    // Blocks 1-3: KerrMaestro
+    for _ in 0..3 {
+        n += N_EMBD * 2; // ln_1
+        n += 3 * N_EMBD * N_EMBD + 3 * N_EMBD; // c_attn
+        n += N_EMBD * N_EMBD + N_EMBD; // c_proj
+        n += N_EMBD * 2; // ln_2
+        n += N_BANDS + N_BANDS + 1 + 1; // gamma_raw, omega, alpha, beta
+        n += MAESTRO_DIM * N_EMBD + MAESTRO_DIM; // squeeze
+        n += N_EMBD * MAESTRO_DIM + N_EMBD; // process
+        n += N_EMBD * N_EMBD + N_EMBD; // out_proj
+    }
+
+    n += N_EMBD * 2; // ln_f
+    n += vocab_size * N_EMBD; // lm_head
+    n
+}
 
 pub fn count_params(model: &ModelWeights) -> usize {
     let mut n = 0;
