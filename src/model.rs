@@ -310,7 +310,7 @@ impl ModelWeights {
         result
     }
 
-    fn per_band_linear(&self, weights: &PerBandLinearWeights, x: &[Vec<f32>]) -> Vec<Vec<f32>> {
+    pub fn per_band_linear(&self, weights: &PerBandLinearWeights, x: &[Vec<f32>]) -> Vec<Vec<f32>> {
         let t = x.len();
         let mut result = Vec::with_capacity(t);
 
@@ -335,7 +335,7 @@ impl ModelWeights {
         result
     }
 
-    fn kerr_maestro_add(&self, weights: &KerrMaestroAddWeights, x: &[Vec<f32>]) -> Vec<Vec<f32>> {
+    pub fn kerr_maestro_add(&self, weights: &KerrMaestroAddWeights, x: &[Vec<f32>]) -> Vec<Vec<f32>> {
         let t = x.len();
         let mut result = Vec::with_capacity(t);
 
@@ -359,7 +359,7 @@ impl ModelWeights {
         result
     }
 
-    fn kerr_ode_forward(&self, weights: &KerrWeights, x: &[f32]) -> Vec<f32> {
+    pub fn kerr_ode_forward(&self, weights: &KerrWeights, x: &[f32]) -> Vec<f32> {
         // Split into real and imaginary parts
         let mut r = vec![0.0f32; N_BANDS];
         let mut s = vec![0.0f32; N_BANDS];
@@ -388,7 +388,7 @@ impl ModelWeights {
         out
     }
 
-    fn maestro_forward(&self, weights: &MaestroWeights, x: &[f32]) -> Vec<f32> {
+    pub fn maestro_forward(&self, weights: &MaestroWeights, x: &[f32]) -> Vec<f32> {
         // Squeeze: 128 → 16
         let squeezed = linear(&weights.squeeze.w, &weights.squeeze.b, x);
 

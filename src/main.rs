@@ -7,6 +7,7 @@ mod backward;
 mod gpu;
 mod grad_test;
 mod model;
+mod train;
 mod weights;
 
 use std::env;
@@ -33,11 +34,22 @@ fn main() {
             let test_path = args.get(2).map(|s| s.as_str()).unwrap_or("reference/gradient_test.bin");
             grad_test::validate_gradients(test_path);
         }
+        Some("train") => {
+            // Stage 4: training from scratch
+            let data_path = args.get(2).map(|s| s.as_str()).unwrap_or("data/input.txt");
+            let n_iters: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(3000);
+            let batch_size: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(4);
+            let seq_len: usize = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(64);
+            let lr: f32 = args.get(6).and_then(|s| s.parse().ok()).unwrap_or(3e-4);
+            train::train(data_path, n_iters, batch_size, seq_len, lr);
+        }
         _ => {
             println!("Usage:");
             println!("  kerr-engine gpu-test              Stage 1: GPU kernel validation");
             println!("  kerr-engine validate <model.bin>  Stage 2: full forward pass validation");
             println!("  kerr-engine grad-test [test.bin]  Stage 3: gradient validation");
+            println!("  kerr-engine train [data] [iters] [batch] [seq_len] [lr]");
+            println!("                                    Stage 4: train from scratch");
         }
     }
 }

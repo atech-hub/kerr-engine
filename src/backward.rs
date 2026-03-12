@@ -445,7 +445,7 @@ pub fn attention_backward_single(
     q_all: &[Vec<f32>],     // [T][N_EMBD] all queries
     k_all: &[Vec<f32>],     // [T][N_EMBD] all keys
     v_all: &[Vec<f32>],     // [T][N_EMBD] all values
-    att_weights: &[Vec<f32>], // [T][T] post-softmax attention weights (saved from forward)
+    att_weights: &[Vec<f32>], // [N_HEAD][T] post-softmax weights per head at this position
     pos: usize,              // which position we're computing grad for
     d_q_all: &mut [Vec<f32>],
     d_k_all: &mut [Vec<f32>],
@@ -455,7 +455,7 @@ pub fn attention_backward_single(
 
     for head in 0..N_HEAD {
         let offset = head * HEAD_DIM;
-        let att = &att_weights[pos]; // attention weights for this query position
+        let att = &att_weights[head]; // attention weights for this head at this position
 
         // Backward through: out[pos][offset+d] = sum_ki att[ki] * v[ki][offset+d]
         // d_att[ki] = sum_d d_out[offset+d] * v[ki][offset+d]

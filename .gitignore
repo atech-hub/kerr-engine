@@ -419,3 +419,9 @@ FodyWeavers.xsd
 
 # Model weights (binary, large)
 *.bin
+
+# Rust build output
+target/
+
+# Training data (too large for git)
+data/
