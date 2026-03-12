@@ -184,8 +184,10 @@ pub fn train_with_config(config: TrainConfig) {
             println!("{:>6} {:>10.4} {:>6} {:>10.1?}", iter, total_loss, active_bands, iter_time);
         }
 
-        // Eval: generate sample text
+        // Eval: validation loss + sample text
         if iter > 0 && iter % eval_every == 0 {
+            let val_loss = eval_val_loss(&model, &dataset, config.batch_size, config.seq_len, active_bands, 8);
+            println!("  [val_loss={val_loss:.4}]");
             let sample = generate(&model, &dataset, 200, &mut rng);
             println!("\n--- Sample (iter {iter}, {active_bands} bands) ---");
             println!("{sample}");
@@ -217,6 +219,36 @@ pub fn train_with_config(config: TrainConfig) {
     println!("\n=== Final sample ===");
     println!("{sample}");
     println!("===");
+}
+
+/// Evaluate validation loss over multiple batches.
+/// Uses a fixed RNG seed so val loss is comparable across evals.
+fn eval_val_loss(model: &ModelWeights, dataset: &Dataset, batch_size: usize, seq_len: usize, active_bands: usize, n_batches: usize) -> f32 {
+    let mut val_rng = Rng::new(9999); // fixed seed, independent of training RNG
+    let mut total_loss = 0.0f32;
+    let mut n_samples = 0usize;
+
+    for _ in 0..n_batches {
+        let (inputs, targets) = dataset.sample_val_batch(&mut val_rng, batch_size, seq_len);
+        for b in 0..batch_size {
+            let cache = model.forward_with_cache_curriculum(&inputs[b], active_bands);
+            // Compute loss only (no gradients needed)
+            let t = cache.logits.len();
+            let mut batch_loss = 0.0f32;
+            for pos in 0..t {
+                let logits = &cache.logits[pos];
+                let target = targets[b][pos];
+                let max_l = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let exp_l: Vec<f32> = logits.iter().map(|&l| (l - max_l).exp()).collect();
+                let sum_exp: f32 = exp_l.iter().sum();
+                batch_loss += -(exp_l[target] / sum_exp).ln();
+            }
+            total_loss += batch_loss / t as f32;
+            n_samples += 1;
+        }
+    }
+
+    total_loss / n_samples as f32
 }
 
 /// Generate text by sampling from the model.
