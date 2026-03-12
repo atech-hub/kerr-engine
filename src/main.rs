@@ -43,19 +43,24 @@ fn main() {
         }
         Some("train") => {
             // Stage 4: training from scratch
-            let data_path = args.get(2).map(|s| s.as_str()).unwrap_or("data/input.txt");
-            let n_iters: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(3000);
-            let batch_size: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(4);
-            let seq_len: usize = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(64);
-            let lr: f32 = args.get(6).and_then(|s| s.parse().ok()).unwrap_or(3e-4);
-            train::train(data_path, n_iters, batch_size, seq_len, lr);
+            let use_curriculum = !args.iter().any(|a| a == "--no-curriculum");
+            let positional: Vec<&str> = args[2..].iter()
+                .filter(|a| !a.starts_with("--"))
+                .map(|s| s.as_str())
+                .collect();
+            let data_path = positional.first().copied().unwrap_or("data/input.txt");
+            let n_iters: usize = positional.get(1).and_then(|s| s.parse().ok()).unwrap_or(3000);
+            let batch_size: usize = positional.get(2).and_then(|s| s.parse().ok()).unwrap_or(4);
+            let seq_len: usize = positional.get(3).and_then(|s| s.parse().ok()).unwrap_or(64);
+            let lr: f32 = positional.get(4).and_then(|s| s.parse().ok()).unwrap_or(3e-4);
+            train::train(data_path, n_iters, batch_size, seq_len, lr, use_curriculum);
         }
         _ => {
             println!("Usage:");
             println!("  kerr-engine gpu-test              Stage 1: GPU kernel validation");
             println!("  kerr-engine validate <model.bin>  Stage 2: full forward pass validation");
             println!("  kerr-engine grad-test [test.bin]  Stage 3: gradient validation");
-            println!("  kerr-engine train [data] [iters] [batch] [seq_len] [lr]");
+            println!("  kerr-engine train [data] [iters] [batch] [seq_len] [lr] [--no-curriculum]");
             println!("                                    Stage 4: train from scratch");
         }
     }

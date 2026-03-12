@@ -11,9 +11,61 @@ use crate::rng::Rng;
 
 use std::thread;
 
+// ─── Curriculum schedule ─────────────────────────────────────
+
+/// Band stages for progressive curriculum.
+/// Each entry is (bands, fraction_of_training).
+/// Fractions must sum to 1.0. Default: Phase C schedule.
+pub struct CurriculumSchedule {
+    stages: Vec<(usize, f32)>,
+}
+
+impl CurriculumSchedule {
+    /// Default 3-stage schedule matching Phase C Python.
+    pub fn default_3stage() -> Self {
+        Self {
+            stages: vec![(8, 0.333), (24, 0.333), (N_BANDS, 0.334)],
+        }
+    }
+
+    /// No curriculum — all bands from the start.
+    #[allow(dead_code)]
+    pub fn none() -> Self {
+        Self {
+            stages: vec![(N_BANDS, 1.0)],
+        }
+    }
+
+    /// Returns active bands for the given iteration.
+    pub fn active_bands(&self, iter: usize, n_iters: usize) -> usize {
+        let mut cumulative = 0.0f32;
+        for &(bands, frac) in &self.stages {
+            cumulative += frac;
+            if iter < (cumulative * n_iters as f32) as usize {
+                return bands;
+            }
+        }
+        self.stages.last().unwrap().0
+    }
+
+    /// Print schedule for logging.
+    pub fn describe(&self, n_iters: usize) {
+        let mut start = 0;
+        let mut cumulative = 0.0f32;
+        for &(bands, frac) in &self.stages {
+            cumulative += frac;
+            let end = (cumulative * n_iters as f32) as usize;
+            print!("{bands} bands ({start}-{end})");
+            start = end;
+            if end < n_iters { print!(", "); }
+        }
+        println!();
+    }
+}
+
 // ─── Training loop ────────────────────────────────────────────
 
-pub fn train(data_path: &str, n_iters: usize, batch_size: usize, seq_len: usize, lr: f32) {
+pub fn train(data_path: &str, n_iters: usize, batch_size: usize, seq_len: usize, lr: f32, use_curriculum: bool) {
     println!("Stage 4 — training from scratch\n");
 
     // Load dataset
@@ -34,10 +86,19 @@ pub fn train(data_path: &str, n_iters: usize, batch_size: usize, seq_len: usize,
         .map(|n| n.get().min(batch_size))
         .unwrap_or(1);
 
+    // Curriculum schedule
+    let curriculum = if use_curriculum {
+        CurriculumSchedule::default_3stage()
+    } else {
+        CurriculumSchedule::none()
+    };
+    print!("  Curriculum: ");
+    curriculum.describe(n_iters);
+
     // Training
     println!("\nTraining for {n_iters} iterations (batch_size={batch_size}, seq_len={seq_len}, lr={lr}, threads={n_threads})");
-    println!("{:>6} {:>10} {:>10}", "Iter", "Loss", "Time");
-    println!("{}", "-".repeat(30));
+    println!("{:>6} {:>10} {:>6} {:>10}", "Iter", "Loss", "Bands", "Time");
+    println!("{}", "-".repeat(40));
 
     let mut rng = Rng::new(1337);
     let log_every = 50;
@@ -47,6 +108,7 @@ pub fn train(data_path: &str, n_iters: usize, batch_size: usize, seq_len: usize,
 
     for iter in 0..n_iters {
         let iter_start = std::time::Instant::now();
+        let active_bands = curriculum.active_bands(iter, n_iters);
 
         let (inputs, targets) = dataset.sample_batch(&mut rng, batch_size, seq_len);
 
@@ -57,7 +119,7 @@ pub fn train(data_path: &str, n_iters: usize, batch_size: usize, seq_len: usize,
                 let input_ref = &inputs[b];
                 let target_ref = &targets[b];
                 s.spawn(move || {
-                    let cache = model_ref.forward_with_cache(input_ref);
+                    let cache = model_ref.forward_with_cache_curriculum(input_ref, active_bands);
                     let (loss, grads) = model_ref.backward(&cache, target_ref);
                     let flat_grads = optim::flatten_grads(&grads);
                     (loss, flat_grads)
@@ -91,13 +153,13 @@ pub fn train(data_path: &str, n_iters: usize, batch_size: usize, seq_len: usize,
         let iter_time = iter_start.elapsed();
 
         if iter % log_every == 0 || iter == n_iters - 1 {
-            println!("{:>6} {:>10.4} {:>10.1?}", iter, total_loss, iter_time);
+            println!("{:>6} {:>10.4} {:>6} {:>10.1?}", iter, total_loss, active_bands, iter_time);
         }
 
         // Eval: generate sample text
         if iter > 0 && iter % eval_every == 0 {
             let sample = generate(&model, &dataset, 200, &mut rng);
-            println!("\n--- Sample (iter {iter}) ---");
+            println!("\n--- Sample (iter {iter}, {active_bands} bands) ---");
             println!("{sample}");
             println!("---\n");
         }

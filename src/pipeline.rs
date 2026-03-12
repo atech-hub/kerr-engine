@@ -144,7 +144,14 @@ fn linear_no_bias_fn(w: &[Vec<f32>], x: &[f32]) -> Vec<f32> {
 
 impl ModelWeights {
     /// Forward pass with saved activations for backward.
+    #[allow(dead_code)]
     pub fn forward_with_cache(&self, tokens: &[usize]) -> ForwardCache {
+        self.forward_with_cache_curriculum(tokens, N_BANDS)
+    }
+
+    /// Forward pass with curriculum band masking.
+    /// Bands beyond `active_bands` are zeroed after embedding.
+    pub fn forward_with_cache_curriculum(&self, tokens: &[usize], active_bands: usize) -> ForwardCache {
         let t = tokens.len();
 
         // Embedding + positional
@@ -153,6 +160,12 @@ impl ModelWeights {
             let mut h = vec![0.0f32; N_EMBD];
             for i in 0..N_EMBD {
                 h[i] = self.wte_phase[tok][i] + self.wpe[pos][i];
+            }
+            // Curriculum: zero inactive bands
+            if active_bands < N_BANDS {
+                for i in (active_bands * 2)..N_EMBD {
+                    h[i] = 0.0;
+                }
             }
             hidden.push(h);
         }
