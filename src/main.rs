@@ -45,6 +45,7 @@ fn main() {
         Some("train") => {
             // Stage 4: training from scratch (or resume from checkpoint)
             let use_curriculum = !args.iter().any(|a| a == "--no-curriculum");
+            let word_level = args.iter().any(|a| a == "--word");
             let resume_path = args.iter()
                 .position(|a| a == "--resume")
                 .and_then(|i| args.get(i + 1))
@@ -70,6 +71,7 @@ fn main() {
                 seq_len,
                 lr,
                 use_curriculum,
+                word_level,
                 resume_path,
                 checkpoint_every: 500,
             });
@@ -79,7 +81,7 @@ fn main() {
             println!("  kerr-engine gpu-test              Stage 1: GPU kernel validation");
             println!("  kerr-engine validate <model.bin>  Stage 2: full forward pass validation");
             println!("  kerr-engine grad-test [test.bin]  Stage 3: gradient validation");
-            println!("  kerr-engine train [data] [iters] [batch] [seq_len] [lr] [--no-curriculum] [--resume FILE]");
+            println!("  kerr-engine train [data] [iters] [batch] [seq_len] [lr] [--no-curriculum] [--word] [--resume FILE]");
             println!("                                    Stage 4: train from scratch (or resume)");
         }
     }

@@ -74,6 +74,7 @@ pub struct TrainConfig {
     pub seq_len: usize,
     pub lr: f32,
     pub use_curriculum: bool,
+    pub word_level: bool,
     pub resume_path: Option<String>,
     pub checkpoint_every: usize,
 }
@@ -85,7 +86,11 @@ pub fn train_with_config(config: TrainConfig) {
 
     // Load dataset
     println!("Loading dataset from {}...", config.data_path);
-    let dataset = Dataset::from_file(&config.data_path);
+    let dataset = if config.word_level {
+        Dataset::from_file_words(&config.data_path, 0.9, 3)
+    } else {
+        Dataset::from_file(&config.data_path)
+    };
 
     // Init or resume
     let (mut model, mut optimizer, mut rng, start_iter) = if let Some(ref path) = config.resume_path {
@@ -253,8 +258,8 @@ fn eval_val_loss(model: &ModelWeights, dataset: &Dataset, batch_size: usize, seq
 
 /// Generate text by sampling from the model.
 fn generate(model: &ModelWeights, dataset: &Dataset, n_tokens: usize, rng: &mut Rng) -> String {
-    let newline_idx = dataset.char_to_idx.get(&'\n').copied().unwrap_or(0);
-    let mut tokens = vec![newline_idx];
+    let start_idx = *dataset.token_to_idx.get("\n").unwrap_or(&0);
+    let mut tokens = vec![start_idx];
 
     for _ in 0..n_tokens {
         let start = if tokens.len() > BLOCK_SIZE { tokens.len() - BLOCK_SIZE } else { 0 };
@@ -282,14 +287,5 @@ fn generate(model: &ModelWeights, dataset: &Dataset, n_tokens: usize, rng: &mut 
         tokens.push(chosen);
     }
 
-    tokens.iter()
-        .skip(1)
-        .map(|&t| {
-            if t < dataset.idx_to_char.len() {
-                dataset.idx_to_char[t]
-            } else {
-                '?'
-            }
-        })
-        .collect()
+    dataset.decode(&tokens[1..])
 }
