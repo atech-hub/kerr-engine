@@ -469,6 +469,20 @@ fn rk4_step(
     (r_new, s_new)
 }
 
+/// Public wrapper for rk4_step (needed by backward.rs).
+pub fn rk4_step_public(
+    r: &[f32], s: &[f32], dt: f32,
+    gamma: &[f32], omega: &[f32],
+    alpha: f32, beta: f32,
+) -> (Vec<f32>, Vec<f32>) {
+    rk4_step(r, s, dt, gamma, omega, alpha, beta)
+}
+
+/// Public wrapper for linear (needed by backward.rs).
+pub fn linear_fn(w: &[Vec<f32>], b: &[f32], x: &[f32]) -> Vec<f32> {
+    linear(w, b, x)
+}
+
 /// Linear without bias: y[i] = sum_j w[i][j] * x[j]
 fn linear_no_bias(w: &[Vec<f32>], x: &[f32]) -> Vec<f32> {
     let out_dim = w.len();

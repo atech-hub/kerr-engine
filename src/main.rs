@@ -3,7 +3,9 @@
 //! Stage 1: Single Euler step GPU validation (COMPLETE)
 //! Stage 2: Full forward pass, load Python weights, validate against Python logits.
 
+mod backward;
 mod gpu;
+mod grad_test;
 mod model;
 mod weights;
 
@@ -26,10 +28,16 @@ fn main() {
             // Stage 1: GPU kernel validation
             gpu_kernel_test();
         }
+        Some("grad-test") => {
+            // Stage 3: gradient validation
+            let test_path = args.get(2).map(|s| s.as_str()).unwrap_or("reference/gradient_test.bin");
+            grad_test::validate_gradients(test_path);
+        }
         _ => {
             println!("Usage:");
             println!("  kerr-engine gpu-test              Stage 1: GPU kernel validation");
             println!("  kerr-engine validate <model.bin>  Stage 2: full forward pass validation");
+            println!("  kerr-engine grad-test [test.bin]  Stage 3: gradient validation");
         }
     }
 }
