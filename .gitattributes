@@ -1,0 +1,6 @@
+# Normalize line endings to LF in repo, native on checkout
+* text=auto eol=lf
+
+# Binary files
+*.bin binary
+*.whl binary
