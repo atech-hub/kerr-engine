@@ -9,6 +9,8 @@ use crate::init::init_model;
 use crate::optim::{self, Adam};
 use crate::rng::Rng;
 
+use std::thread;
+
 // ─── Training loop ────────────────────────────────────────────
 
 pub fn train(data_path: &str, n_iters: usize, batch_size: usize, seq_len: usize, lr: f32) {
@@ -27,8 +29,13 @@ pub fn train(data_path: &str, n_iters: usize, batch_size: usize, seq_len: usize,
     // Init Adam
     let mut optimizer = Adam::new(lr, n_params);
 
+    // Detect thread count
+    let n_threads = thread::available_parallelism()
+        .map(|n| n.get().min(batch_size))
+        .unwrap_or(1);
+
     // Training
-    println!("\nTraining for {n_iters} iterations (batch_size={batch_size}, seq_len={seq_len}, lr={lr})");
+    println!("\nTraining for {n_iters} iterations (batch_size={batch_size}, seq_len={seq_len}, lr={lr}, threads={n_threads})");
     println!("{:>6} {:>10} {:>10}", "Iter", "Loss", "Time");
     println!("{}", "-".repeat(30));
 
@@ -43,28 +50,34 @@ pub fn train(data_path: &str, n_iters: usize, batch_size: usize, seq_len: usize,
 
         let (inputs, targets) = dataset.sample_batch(&mut rng, batch_size, seq_len);
 
+        // Parallel forward+backward across batch elements
+        let batch_results: Vec<(f32, Vec<f32>)> = thread::scope(|s| {
+            let handles: Vec<_> = (0..batch_size).map(|b| {
+                let model_ref = &model;
+                let input_ref = &inputs[b];
+                let target_ref = &targets[b];
+                s.spawn(move || {
+                    let cache = model_ref.forward_with_cache(input_ref);
+                    let (loss, grads) = model_ref.backward(&cache, target_ref);
+                    let flat_grads = optim::flatten_grads(&grads);
+                    (loss, flat_grads)
+                })
+            }).collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        // Reduce: sum losses and gradients
         let mut total_loss = 0.0f32;
-        let mut accumulated_grads: Option<Vec<f32>> = None;
-
-        for b in 0..batch_size {
-            let cache = model.forward_with_cache(&inputs[b]);
-            let (loss, grads) = model.backward(&cache, &targets[b]);
+        let mut grads = vec![0.0f32; n_params];
+        for (loss, fg) in &batch_results {
             total_loss += loss;
-
-            let flat_grads = optim::flatten_grads(&grads);
-            match &mut accumulated_grads {
-                None => accumulated_grads = Some(flat_grads),
-                Some(acc) => {
-                    for (a, g) in acc.iter_mut().zip(flat_grads.iter()) {
-                        *a += g;
-                    }
-                }
+            for (a, g) in grads.iter_mut().zip(fg.iter()) {
+                *a += g;
             }
         }
 
         // Average over batch
         total_loss /= batch_size as f32;
-        let mut grads = accumulated_grads.unwrap();
         for g in grads.iter_mut() { *g /= batch_size as f32; }
 
         // Gradient clipping
