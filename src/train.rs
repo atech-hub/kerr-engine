@@ -11,6 +11,7 @@ use crate::init::init_model;
 use crate::optim::{self, Adam};
 use crate::rng::Rng;
 
+use std::io::Write;
 use std::thread;
 
 // ─── Curriculum schedule ─────────────────────────────────────
@@ -137,6 +138,10 @@ pub fn train_with_config(config: TrainConfig) {
     let log_every = 50;
     let eval_every = 300;
 
+    // Track loss history for summary
+    let mut loss_history: Vec<(usize, f32)> = Vec::new();
+    let mut val_history: Vec<(usize, f32)> = Vec::new();
+
     let train_start = std::time::Instant::now();
 
     for iter in start_iter..config.n_iters {
@@ -187,12 +192,14 @@ pub fn train_with_config(config: TrainConfig) {
 
         if iter % log_every == 0 || iter == config.n_iters - 1 {
             println!("{:>6} {:>10.4} {:>6} {:>10.1?}", iter, total_loss, active_bands, iter_time);
+            loss_history.push((iter, total_loss));
         }
 
         // Eval: validation loss + sample text
         if iter > 0 && iter % eval_every == 0 {
             let val_loss = eval_val_loss(&model, &dataset, config.batch_size, config.seq_len, active_bands, 8);
             println!("  [val_loss={val_loss:.4}]");
+            val_history.push((iter, val_loss));
             let sample = generate(&model, &dataset, 200, &mut rng);
             println!("\n--- Sample (iter {iter}, {active_bands} bands) ---");
             println!("{sample}");
@@ -212,6 +219,15 @@ pub fn train_with_config(config: TrainConfig) {
     let total_time = train_start.elapsed();
     println!("\nTraining complete. Total time: {total_time:.1?}");
 
+    // Final val loss
+    let final_active = curriculum.active_bands(config.n_iters.saturating_sub(1), config.n_iters);
+    let final_val = eval_val_loss(&model, &dataset, config.batch_size, config.seq_len, final_active, 8);
+    println!("  Final val_loss: {final_val:.4}");
+    val_history.push((config.n_iters, final_val));
+
+    // Write training summary
+    write_summary(&config, &dataset, n_params, total_time.as_secs_f32(), &loss_history, &val_history);
+
     // Save final checkpoint
     let path = format!("checkpoint_final.bin");
     match checkpoint::save(&path, &model, &optimizer, &rng, config.n_iters, config.lr) {
@@ -224,6 +240,60 @@ pub fn train_with_config(config: TrainConfig) {
     println!("\n=== Final sample ===");
     println!("{sample}");
     println!("===");
+}
+
+/// Write JSON training summary for cross-run comparison.
+fn write_summary(
+    config: &TrainConfig,
+    dataset: &Dataset,
+    n_params: usize,
+    total_secs: f32,
+    loss_history: &[(usize, f32)],
+    val_history: &[(usize, f32)],
+) {
+    let path = "training_summary.json";
+    let mut f = match std::fs::File::create(path) {
+        Ok(f) => f,
+        Err(e) => { println!("  [summary write failed: {e}]"); return; }
+    };
+
+    let mode = if config.word_level { "word" } else { "char" };
+    let final_train = loss_history.last().map(|(_, l)| *l).unwrap_or(0.0);
+    let final_val = val_history.last().map(|(_, l)| *l).unwrap_or(0.0);
+
+    // Hand-write JSON to avoid serde dependency
+    let _ = writeln!(f, "{{");
+    let _ = writeln!(f, "  \"data_path\": \"{}\",", config.data_path.replace('\\', "/"));
+    let _ = writeln!(f, "  \"mode\": \"{mode}\",");
+    let _ = writeln!(f, "  \"vocab_size\": {},", dataset.vocab_size);
+    let _ = writeln!(f, "  \"n_params\": {n_params},");
+    let _ = writeln!(f, "  \"n_iters\": {},", config.n_iters);
+    let _ = writeln!(f, "  \"batch_size\": {},", config.batch_size);
+    let _ = writeln!(f, "  \"seq_len\": {},", config.seq_len);
+    let _ = writeln!(f, "  \"lr\": {},", config.lr);
+    let _ = writeln!(f, "  \"curriculum\": {},", config.use_curriculum);
+    let _ = writeln!(f, "  \"total_seconds\": {total_secs:.1},");
+    let _ = writeln!(f, "  \"final_train_loss\": {final_train:.4},");
+    let _ = writeln!(f, "  \"final_val_loss\": {final_val:.4},");
+
+    // Loss curve
+    let _ = write!(f, "  \"train_loss\": [");
+    for (i, (iter, loss)) in loss_history.iter().enumerate() {
+        if i > 0 { let _ = write!(f, ", "); }
+        let _ = write!(f, "[{iter}, {loss:.4}]");
+    }
+    let _ = writeln!(f, "],");
+
+    // Val loss curve
+    let _ = write!(f, "  \"val_loss\": [");
+    for (i, (iter, loss)) in val_history.iter().enumerate() {
+        if i > 0 { let _ = write!(f, ", "); }
+        let _ = write!(f, "[{iter}, {loss:.4}]");
+    }
+    let _ = writeln!(f, "]");
+
+    let _ = writeln!(f, "}}");
+    println!("  [summary saved: {path}]");
 }
 
 /// Evaluate validation loss over multiple batches.
