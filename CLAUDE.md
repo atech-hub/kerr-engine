@@ -98,7 +98,7 @@ Default training: `kerr-engine train data/input.txt 3000 4 64 3e-4`
 | 150 | 2.5558 |
 | 199 | 2.5814 |
 
-Generated text must be character-identical. If numbers drift, the refactor broke something.
+Seeds: model init = 42, training RNG = 1337. Both must match for character-identical output. If numbers drift, the refactor broke something.
 
 ---
 
