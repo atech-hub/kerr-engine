@@ -3,10 +3,16 @@
 //! Stage 1: Single Euler step GPU validation (COMPLETE)
 //! Stage 2: Full forward pass, load Python weights, validate against Python logits.
 
+mod backend;
 mod backward;
+mod data;
 mod gpu;
 mod grad_test;
+mod init;
 mod model;
+mod optim;
+mod pipeline;
+mod rng;
 mod train;
 mod weights;
 
