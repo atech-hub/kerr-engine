@@ -7,15 +7,59 @@
 
 use std::f32::consts::PI;
 
-// Architecture constants (must match phaseC_integrated.py)
+// ─── Model configuration ──────────────────────────────────────
+
+/// Runtime-configurable architecture dimensions.
+/// Stored in ModelWeights so every function can derive dims from data or config.
+#[derive(Clone, Copy, Debug)]
+pub struct ModelConfig {
+    pub n_bands: usize,
+    pub n_head: usize,
+    pub n_layers: usize,
+    pub maestro_dim: usize,
+    pub block_size: usize,
+    pub rk4_n_steps: usize,
+}
+
+impl ModelConfig {
+    /// Default config matching the original 128-dim architecture.
+    pub fn default_128() -> Self {
+        Self {
+            n_bands: 64,
+            n_head: 4,
+            n_layers: 4,
+            maestro_dim: 16,
+            block_size: 256,
+            rk4_n_steps: 8,
+        }
+    }
+
+    pub fn n_embd(&self) -> usize { self.n_bands * 2 }
+    #[allow(dead_code)]
+    pub fn head_dim(&self) -> usize { self.n_embd() / self.n_head }
+    #[allow(dead_code)]
+    pub fn rk4_dt(&self) -> f32 { 1.0 / self.rk4_n_steps as f32 }
+
+    pub fn validate(&self) {
+        assert!(self.n_bands > 0, "n_bands must be > 0");
+        assert!(self.n_head > 0, "n_head must be > 0");
+        assert_eq!(self.n_embd() % self.n_head, 0, "n_embd must be divisible by n_head");
+        assert!(self.rk4_n_steps > 0, "rk4_n_steps must be > 0");
+    }
+}
+
+// Legacy compile-time constants — kept for init.rs defaults and backward compatibility.
+// New code should use ModelConfig or derive from data dimensions.
 pub const N_BANDS: usize = 64;
-pub const N_EMBD: usize = 128;  // = N_BANDS * 2
+pub const N_EMBD: usize = 128;
 pub const N_HEAD: usize = 4;
-pub const HEAD_DIM: usize = N_EMBD / N_HEAD;  // = 32
+#[allow(dead_code)]
+pub const HEAD_DIM: usize = N_EMBD / N_HEAD;
 pub const BLOCK_SIZE: usize = 256;
 pub const MAESTRO_DIM: usize = 16;
 pub const RK4_N_STEPS: usize = 8;
-pub const RK4_DT: f32 = 1.0 / RK4_N_STEPS as f32;  // = 0.125
+#[allow(dead_code)]
+pub const RK4_DT: f32 = 1.0 / RK4_N_STEPS as f32;
 pub const N_LAYERS: usize = 4;
 
 /// Softplus: log(1 + exp(x))
@@ -33,11 +77,34 @@ fn gelu(x: f32) -> f32 {
 }
 
 /// Build frozen harmonic embedding table.
-/// Returns [vocab_size][N_EMBD] array.
+/// Returns [vocab_size][n_embd] array.
+#[allow(dead_code)]
 pub fn build_harmonic_table(vocab_size: usize) -> Vec<Vec<f32>> {
-    let nh = N_EMBD / 2;
+    // n_embd derived from vocab table: caller sizes it via config, but the formula
+    // only depends on vocab_size and n_bands. We use N_EMBD for the legacy path
+    // and data-derived for the config path. Since this is called from init_model
+    // which knows config, the table size is correct.
+    let n_embd = N_EMBD; // Legacy — will be parameterized in Phase 2
+    let nh = n_embd / 2;
     let scale = 1.0 / (nh as f32).sqrt();
-    let mut table = vec![vec![0.0f32; N_EMBD]; vocab_size];
+    let mut table = vec![vec![0.0f32; n_embd]; vocab_size];
+
+    for c in 0..vocab_size {
+        let theta = c as f32 * 2.0 * PI / vocab_size as f32;
+        for h in 0..nh {
+            let angle = (h + 1) as f32 * theta;
+            table[c][h * 2] = angle.cos() * scale;
+            table[c][h * 2 + 1] = angle.sin() * scale;
+        }
+    }
+    table
+}
+
+/// Build frozen harmonic embedding table with explicit n_embd.
+pub fn build_harmonic_table_sized(vocab_size: usize, n_embd: usize) -> Vec<Vec<f32>> {
+    let nh = n_embd / 2;
+    let scale = 1.0 / (nh as f32).sqrt();
+    let mut table = vec![vec![0.0f32; n_embd]; vocab_size];
 
     for c in 0..vocab_size {
         let theta = c as f32 * 2.0 * PI / vocab_size as f32;
@@ -51,15 +118,15 @@ pub fn build_harmonic_table(vocab_size: usize) -> Vec<Vec<f32>> {
 }
 
 /// Build positional encoding table.
-/// Returns [BLOCK_SIZE][N_EMBD] array.
-pub fn build_positional_table() -> Vec<Vec<f32>> {
-    let nh = N_EMBD / 2;
+/// Returns [block_size][n_embd] array.
+pub fn build_positional_table(block_size: usize, n_embd: usize) -> Vec<Vec<f32>> {
+    let nh = n_embd / 2;
     let scale = 1.0 / (nh as f32).sqrt();
-    let mut table = vec![vec![0.0f32; N_EMBD]; BLOCK_SIZE];
+    let mut table = vec![vec![0.0f32; n_embd]; block_size];
 
-    for pos in 0..BLOCK_SIZE {
+    for pos in 0..block_size {
         for h in 0..nh {
-            let freq = 1.0 / 10000.0_f32.powf(2.0 * h as f32 / N_EMBD as f32);
+            let freq = 1.0 / 10000.0_f32.powf(2.0 * h as f32 / n_embd as f32);
             table[pos][h * 2] = (pos as f32 * freq).cos() * scale;
             table[pos][h * 2 + 1] = (pos as f32 * freq).sin() * scale;
         }
@@ -71,17 +138,14 @@ pub fn build_positional_table() -> Vec<Vec<f32>> {
 
 /// Matrix-vector multiply: y = W @ x + b
 /// W is [out_dim][in_dim], x is [in_dim], b is [out_dim]
+#[inline]
 fn linear(w: &[Vec<f32>], b: &[f32], x: &[f32]) -> Vec<f32> {
-    let out_dim = w.len();
-    let mut y = vec![0.0f32; out_dim];
-    for i in 0..out_dim {
-        let mut sum = b[i];
-        for j in 0..x.len() {
-            sum += w[i][j] * x[j];
-        }
-        y[i] = sum;
-    }
-    y
+    w.iter()
+        .zip(b.iter())
+        .map(|(row, &bias)| {
+            bias + row.iter().zip(x.iter()).map(|(&a, &b)| a * b).sum::<f32>()
+        })
+        .collect()
 }
 
 /// Layer normalization: y = (x - mean) / sqrt(var + eps) * weight + bias
@@ -119,6 +183,7 @@ pub struct LayerNormWeights {
 pub struct AttentionWeights {
     pub c_attn: LinearWeights,  // [3*N_EMBD, N_EMBD]
     pub c_proj: LinearWeights,  // [N_EMBD, N_EMBD]
+    pub n_head: usize,          // Number of attention heads (for head_dim derivation)
 }
 
 /// Weights for PerBandLinear (Block 0 FFN).
@@ -136,6 +201,7 @@ pub struct KerrWeights {
     pub omega: Vec<f32>,      // [N_BANDS]
     pub alpha: f32,
     pub beta: f32,
+    pub rk4_n_steps: usize,   // ODE integration steps (default 8)
 }
 
 /// Weights for Maestro.
@@ -171,10 +237,11 @@ pub enum FfnWeights {
 
 /// Full model weights.
 pub struct ModelWeights {
+    pub config: ModelConfig,
     pub vocab_size: usize,
     pub wte_phase: Vec<Vec<f32>>,  // [vocab_size][N_EMBD] (frozen)
     pub wpe: Vec<Vec<f32>>,        // [BLOCK_SIZE][N_EMBD] (frozen)
-    pub blocks: Vec<BlockWeights>, // 4 blocks
+    pub blocks: Vec<BlockWeights>, // n_layers blocks
     pub ln_f: LayerNormWeights,
     pub lm_head: Vec<Vec<f32>>,    // [vocab_size][N_EMBD] (no bias)
 }
@@ -185,13 +252,14 @@ impl ModelWeights {
     /// Full forward pass: token indices → logits.
     pub fn forward(&self, tokens: &[usize]) -> Vec<Vec<f32>> {
         let t = tokens.len();
-        assert!(t <= BLOCK_SIZE);
+        let n_embd = self.config.n_embd();
+        assert!(t <= self.config.block_size);
 
         // Embedding + positional encoding
         let mut hidden: Vec<Vec<f32>> = Vec::with_capacity(t);
         for (pos, &tok) in tokens.iter().enumerate() {
-            let mut h = vec![0.0f32; N_EMBD];
-            for i in 0..N_EMBD {
+            let mut h = vec![0.0f32; n_embd];
+            for i in 0..n_embd {
                 h[i] = self.wte_phase[tok][i] + self.wpe[pos][i];
             }
             hidden.push(h);
@@ -215,6 +283,7 @@ impl ModelWeights {
 
     fn forward_block(&self, block: &BlockWeights, hidden: &[Vec<f32>]) -> Vec<Vec<f32>> {
         let t = hidden.len();
+        let n_embd = self.config.n_embd();
 
         // x = x + attn(ln_1(x))
         let normed_1: Vec<Vec<f32>> = hidden.iter()
@@ -223,8 +292,8 @@ impl ModelWeights {
         let attn_out = self.causal_self_attention(&block.attn, &normed_1);
         let mut h: Vec<Vec<f32>> = (0..t)
             .map(|i| {
-                let mut v = vec![0.0f32; N_EMBD];
-                for j in 0..N_EMBD { v[j] = hidden[i][j] + attn_out[i][j]; }
+                let mut v = vec![0.0f32; n_embd];
+                for j in 0..n_embd { v[j] = hidden[i][j] + attn_out[i][j]; }
                 v
             })
             .collect();
@@ -238,7 +307,7 @@ impl ModelWeights {
             FfnWeights::KerrMaestro(w) => self.kerr_maestro_add(w, &normed_2),
         };
         for i in 0..t {
-            for j in 0..N_EMBD { h[i][j] += ffn_out[i][j]; }
+            for j in 0..n_embd { h[i][j] += ffn_out[i][j]; }
         }
 
         h
@@ -246,27 +315,30 @@ impl ModelWeights {
 
     fn causal_self_attention(&self, weights: &AttentionWeights, x: &[Vec<f32>]) -> Vec<Vec<f32>> {
         let t = x.len();
+        let n_embd = self.config.n_embd();
+        let n_head = weights.n_head;
+        let head_dim = n_embd / n_head;
 
         // Compute Q, K, V for all positions
-        let mut q_all = vec![vec![0.0f32; N_EMBD]; t];
-        let mut k_all = vec![vec![0.0f32; N_EMBD]; t];
-        let mut v_all = vec![vec![0.0f32; N_EMBD]; t];
+        let mut q_all = vec![vec![0.0f32; n_embd]; t];
+        let mut k_all = vec![vec![0.0f32; n_embd]; t];
+        let mut v_all = vec![vec![0.0f32; n_embd]; t];
 
         for pos in 0..t {
             let qkv = linear(&weights.c_attn.w, &weights.c_attn.b, &x[pos]);
-            for i in 0..N_EMBD {
+            for i in 0..n_embd {
                 q_all[pos][i] = qkv[i];
-                k_all[pos][i] = qkv[N_EMBD + i];
-                v_all[pos][i] = qkv[2 * N_EMBD + i];
+                k_all[pos][i] = qkv[n_embd + i];
+                v_all[pos][i] = qkv[2 * n_embd + i];
             }
         }
 
         // Multi-head attention
-        let scale = 1.0 / (HEAD_DIM as f32).sqrt();
-        let mut out = vec![vec![0.0f32; N_EMBD]; t];
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let mut out = vec![vec![0.0f32; n_embd]; t];
 
-        for head in 0..N_HEAD {
-            let offset = head * HEAD_DIM;
+        for head in 0..n_head {
+            let offset = head * head_dim;
 
             // Compute attention scores for this head
             for qi in 0..t {
@@ -274,7 +346,7 @@ impl ModelWeights {
                 let mut att = vec![f32::NEG_INFINITY; t];
                 for ki in 0..=qi {  // causal: only attend to past
                     let mut dot = 0.0f32;
-                    for d in 0..HEAD_DIM {
+                    for d in 0..head_dim {
                         dot += q_all[qi][offset + d] * k_all[ki][offset + d];
                     }
                     att[ki] = dot * scale;
@@ -292,7 +364,7 @@ impl ModelWeights {
                 }
 
                 // Weighted sum of values
-                for d in 0..HEAD_DIM {
+                for d in 0..head_dim {
                     let mut sum = 0.0f32;
                     for ki in 0..=qi {
                         sum += att[ki] * v_all[ki][offset + d];
@@ -312,12 +384,14 @@ impl ModelWeights {
 
     pub fn per_band_linear(&self, weights: &PerBandLinearWeights, x: &[Vec<f32>]) -> Vec<Vec<f32>> {
         let t = x.len();
+        let n_bands = weights.band_w.len();
+        let n_embd = n_bands * 2;
         let mut result = Vec::with_capacity(t);
 
         for pos in 0..t {
-            let mut bands_out = vec![0.0f32; N_EMBD];
+            let mut bands_out = vec![0.0f32; n_embd];
 
-            for band in 0..N_BANDS {
+            for band in 0..n_bands {
                 let r_in = x[pos][band * 2];
                 let s_in = x[pos][band * 2 + 1];
                 let w = &weights.band_w[band];
@@ -347,8 +421,9 @@ impl ModelWeights {
             let maestro_out = self.maestro_forward(&weights.maestro, &x[pos]);
 
             // Combine + project
-            let mut combined = vec![0.0f32; N_EMBD];
-            for i in 0..N_EMBD {
+            let n_embd = kerr_out.len();
+            let mut combined = vec![0.0f32; n_embd];
+            for i in 0..n_embd {
                 combined[i] = kerr_out[i] + maestro_out[i];
             }
 
@@ -360,10 +435,15 @@ impl ModelWeights {
     }
 
     pub fn kerr_ode_forward(&self, weights: &KerrWeights, x: &[f32]) -> Vec<f32> {
+        let n_bands = weights.gamma_raw.len();
+        let n_embd = n_bands * 2;
+        let n_steps = weights.rk4_n_steps;
+        let dt = 1.0 / n_steps as f32;
+
         // Split into real and imaginary parts
-        let mut r = vec![0.0f32; N_BANDS];
-        let mut s = vec![0.0f32; N_BANDS];
-        for k in 0..N_BANDS {
+        let mut r = vec![0.0f32; n_bands];
+        let mut s = vec![0.0f32; n_bands];
+        for k in 0..n_bands {
             r[k] = x[k * 2];
             s[k] = x[k * 2 + 1];
         }
@@ -371,17 +451,17 @@ impl ModelWeights {
         // Compute gamma (softplus of raw)
         let gamma: Vec<f32> = weights.gamma_raw.iter().map(|&g| softplus(g)).collect();
 
-        // 8 RK4 steps
-        for _ in 0..RK4_N_STEPS {
-            let (r_new, s_new) = rk4_step(&r, &s, RK4_DT, &gamma,
+        // RK4 integration steps
+        for _ in 0..n_steps {
+            let (r_new, s_new) = rk4_step(&r, &s, dt, &gamma,
                                            &weights.omega, weights.alpha, weights.beta);
             r = r_new;
             s = s_new;
         }
 
         // Reinterleave
-        let mut out = vec![0.0f32; N_EMBD];
-        for k in 0..N_BANDS {
+        let mut out = vec![0.0f32; n_embd];
+        for k in 0..n_bands {
             out[k * 2] = r[k];
             out[k * 2 + 1] = s[k];
         }
@@ -479,20 +559,15 @@ pub fn rk4_step_public(
 }
 
 /// Public wrapper for linear (needed by backward.rs).
+#[inline]
 pub fn linear_fn(w: &[Vec<f32>], b: &[f32], x: &[f32]) -> Vec<f32> {
     linear(w, b, x)
 }
 
 /// Linear without bias: y[i] = sum_j w[i][j] * x[j]
+#[inline]
 fn linear_no_bias(w: &[Vec<f32>], x: &[f32]) -> Vec<f32> {
-    let out_dim = w.len();
-    let mut y = vec![0.0f32; out_dim];
-    for i in 0..out_dim {
-        let mut sum = 0.0f32;
-        for j in 0..x.len() {
-            sum += w[i][j] * x[j];
-        }
-        y[i] = sum;
-    }
-    y
+    w.iter()
+        .map(|row| row.iter().zip(x.iter()).map(|(&a, &b)| a * b).sum::<f32>())
+        .collect()
 }

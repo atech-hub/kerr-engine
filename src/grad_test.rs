@@ -140,6 +140,7 @@ pub fn validate_gradients(test_path: &str) {
         omega: py_ode_omega,
         alpha: py_ode_alpha,
         beta: py_ode_beta,
+        rk4_n_steps: RK4_N_STEPS,
     };
 
     let (rust_d_input, rust_ode_d_gamma_raw, rust_ode_d_omega, rust_ode_d_alpha, rust_ode_d_beta) =

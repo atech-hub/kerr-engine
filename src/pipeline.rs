@@ -7,6 +7,7 @@
 
 use crate::model::*;
 use crate::backward::*;
+use crate::backend::ComputeBackend;
 
 // ─── Gradient accumulator ───────────────────────────────────────
 
@@ -53,45 +54,48 @@ pub enum FfnGrads {
 
 impl GradAccum {
     pub fn zeros(weights: &ModelWeights) -> Self {
+        let n_embd = weights.config.n_embd();
+        let n_bands = weights.config.n_bands;
+        let maestro_dim = weights.config.maestro_dim;
         let mut blocks = Vec::new();
         for block in &weights.blocks {
             let ffn = match &block.ffn {
                 FfnWeights::PerBand(_) => FfnGrads::PerBand {
-                    band_w: vec![[[0.0; 2]; 2]; N_BANDS],
-                    band_b: vec![[0.0; 2]; N_BANDS],
-                    out_proj_w: vec![vec![0.0; N_EMBD]; N_EMBD],
-                    out_proj_b: vec![0.0; N_EMBD],
+                    band_w: vec![[[0.0; 2]; 2]; n_bands],
+                    band_b: vec![[0.0; 2]; n_bands],
+                    out_proj_w: vec![vec![0.0; n_embd]; n_embd],
+                    out_proj_b: vec![0.0; n_embd],
                 },
                 FfnWeights::KerrMaestro(_) => FfnGrads::KerrMaestro {
-                    gamma_raw: vec![0.0; N_BANDS],
-                    omega: vec![0.0; N_BANDS],
+                    gamma_raw: vec![0.0; n_bands],
+                    omega: vec![0.0; n_bands],
                     alpha: 0.0,
                     beta: 0.0,
-                    squeeze_w: vec![vec![0.0; N_EMBD]; MAESTRO_DIM],
-                    squeeze_b: vec![0.0; MAESTRO_DIM],
-                    process_w: vec![vec![0.0; MAESTRO_DIM]; N_EMBD],
-                    process_b: vec![0.0; N_EMBD],
-                    out_proj_w: vec![vec![0.0; N_EMBD]; N_EMBD],
-                    out_proj_b: vec![0.0; N_EMBD],
+                    squeeze_w: vec![vec![0.0; n_embd]; maestro_dim],
+                    squeeze_b: vec![0.0; maestro_dim],
+                    process_w: vec![vec![0.0; maestro_dim]; n_embd],
+                    process_b: vec![0.0; n_embd],
+                    out_proj_w: vec![vec![0.0; n_embd]; n_embd],
+                    out_proj_b: vec![0.0; n_embd],
                 },
             };
             blocks.push(BlockGrads {
-                ln_1_weight: vec![0.0; N_EMBD],
-                ln_1_bias: vec![0.0; N_EMBD],
-                attn_c_attn_w: vec![vec![0.0; N_EMBD]; 3 * N_EMBD],
-                attn_c_attn_b: vec![0.0; 3 * N_EMBD],
-                attn_c_proj_w: vec![vec![0.0; N_EMBD]; N_EMBD],
-                attn_c_proj_b: vec![0.0; N_EMBD],
-                ln_2_weight: vec![0.0; N_EMBD],
-                ln_2_bias: vec![0.0; N_EMBD],
+                ln_1_weight: vec![0.0; n_embd],
+                ln_1_bias: vec![0.0; n_embd],
+                attn_c_attn_w: vec![vec![0.0; n_embd]; 3 * n_embd],
+                attn_c_attn_b: vec![0.0; 3 * n_embd],
+                attn_c_proj_w: vec![vec![0.0; n_embd]; n_embd],
+                attn_c_proj_b: vec![0.0; n_embd],
+                ln_2_weight: vec![0.0; n_embd],
+                ln_2_bias: vec![0.0; n_embd],
                 ffn,
             });
         }
         Self {
             blocks,
-            ln_f_weight: vec![0.0; N_EMBD],
-            ln_f_bias: vec![0.0; N_EMBD],
-            lm_head: vec![vec![0.0; N_EMBD]; weights.vocab_size],
+            ln_f_weight: vec![0.0; n_embd],
+            ln_f_bias: vec![0.0; n_embd],
+            lm_head: vec![vec![0.0; n_embd]; weights.vocab_size],
         }
     }
 }
@@ -113,7 +117,6 @@ pub struct BlockCache {
     pub attn_cache: AttnCache,
     pub h1: Vec<Vec<f32>>,
     pub normed_2: Vec<Vec<f32>>,
-    pub ffn_input: Vec<Vec<f32>>,
     pub output: Vec<Vec<f32>>,
 }
 
@@ -126,44 +129,32 @@ pub struct AttnCache {
     pub pre_proj: Vec<Vec<f32>>,
 }
 
-// ─── Helper wrappers ────────────────────────────────────────────
-
-fn layer_norm_fn(x: &[f32], weight: &[f32], bias: &[f32]) -> Vec<f32> {
-    let n = x.len();
-    let mean: f32 = x.iter().sum::<f32>() / n as f32;
-    let var: f32 = x.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / n as f32;
-    let std = (var + 1e-5).sqrt();
-    (0..n).map(|i| (x[i] - mean) / std * weight[i] + bias[i]).collect()
-}
-
-fn linear_no_bias_fn(w: &[Vec<f32>], x: &[f32]) -> Vec<f32> {
-    w.iter().map(|row| row.iter().zip(x.iter()).map(|(a, b)| a * b).sum()).collect()
-}
-
 // ─── Cached forward pass ────────────────────────────────────────
 
 impl ModelWeights {
     /// Forward pass with saved activations for backward.
     #[allow(dead_code)]
-    pub fn forward_with_cache(&self, tokens: &[usize]) -> ForwardCache {
-        self.forward_with_cache_curriculum(tokens, N_BANDS)
+    pub fn forward_with_cache(&self, tokens: &[usize], backend: &dyn ComputeBackend) -> ForwardCache {
+        self.forward_with_cache_curriculum(tokens, self.config.n_bands, backend)
     }
 
     /// Forward pass with curriculum band masking.
     /// Bands beyond `active_bands` are zeroed after embedding.
-    pub fn forward_with_cache_curriculum(&self, tokens: &[usize], active_bands: usize) -> ForwardCache {
+    pub fn forward_with_cache_curriculum(&self, tokens: &[usize], active_bands: usize, backend: &dyn ComputeBackend) -> ForwardCache {
         let t = tokens.len();
+        let n_embd = self.config.n_embd();
+        let n_bands = self.config.n_bands;
 
         // Embedding + positional
         let mut hidden: Vec<Vec<f32>> = Vec::with_capacity(t);
         for (pos, &tok) in tokens.iter().enumerate() {
-            let mut h = vec![0.0f32; N_EMBD];
-            for i in 0..N_EMBD {
+            let mut h = vec![0.0f32; n_embd];
+            for i in 0..n_embd {
                 h[i] = self.wte_phase[tok][i] + self.wpe[pos][i];
             }
             // Curriculum: zero inactive bands
-            if active_bands < N_BANDS {
-                for i in (active_bands * 2)..N_EMBD {
+            if active_bands < n_bands {
+                for i in (active_bands * 2)..n_embd {
                     h[i] = 0.0;
                 }
             }
@@ -173,57 +164,51 @@ impl ModelWeights {
         let mut block_caches = Vec::new();
 
         for block in &self.blocks {
-            let cache = self.forward_block_with_cache(block, &hidden);
-            hidden = cache.output.clone();
+            let mut cache = self.forward_block_with_cache(block, &hidden, backend);
+            // Take output instead of clone — backward never reads bc.output
+            hidden = std::mem::take(&mut cache.output);
             block_caches.push(cache);
         }
 
-        // Final layer norm
-        let normed: Vec<Vec<f32>> = hidden.iter()
-            .map(|h| layer_norm_fn(h, &self.ln_f.weight, &self.ln_f.bias))
-            .collect();
+        // Final layer norm (batched)
+        let normed = backend.layer_norm_batch(&hidden, &self.ln_f.weight, &self.ln_f.bias);
 
-        // LM head
-        let logits: Vec<Vec<f32>> = normed.iter()
-            .map(|n| linear_no_bias_fn(&self.lm_head, n))
-            .collect();
+        // LM head (batched)
+        let logits = backend.linear_no_bias_batch(&self.lm_head, &normed);
 
         ForwardCache {
             tokens: tokens.to_vec(),
             block_caches,
-            pre_ln_f: hidden.iter().map(|h| h.clone()).collect(),
+            pre_ln_f: hidden, // move, not clone — hidden not used after this
             post_ln_f: normed,
             logits,
         }
     }
 
-    fn forward_block_with_cache(&self, block: &BlockWeights, hidden: &[Vec<f32>]) -> BlockCache {
+    fn forward_block_with_cache(&self, block: &BlockWeights, hidden: &[Vec<f32>], backend: &dyn ComputeBackend) -> BlockCache {
         let t = hidden.len();
+        let n_embd = hidden[0].len();
 
-        let normed_1: Vec<Vec<f32>> = hidden.iter()
-            .map(|h| layer_norm_fn(h, &block.ln_1.weight, &block.ln_1.bias))
-            .collect();
+        let normed_1 = backend.layer_norm_batch(hidden, &block.ln_1.weight, &block.ln_1.bias);
 
-        let (attn_out, attn_cache) = self.attention_with_cache(&block.attn, &normed_1);
+        let (attn_out, attn_cache) = self.attention_with_cache(&block.attn, &normed_1, backend);
 
         let h1: Vec<Vec<f32>> = (0..t).map(|i| {
-            let mut v = vec![0.0f32; N_EMBD];
-            for j in 0..N_EMBD { v[j] = hidden[i][j] + attn_out[i][j]; }
+            let mut v = vec![0.0f32; n_embd];
+            for j in 0..n_embd { v[j] = hidden[i][j] + attn_out[i][j]; }
             v
         }).collect();
 
-        let normed_2: Vec<Vec<f32>> = h1.iter()
-            .map(|h| layer_norm_fn(h, &block.ln_2.weight, &block.ln_2.bias))
-            .collect();
+        let normed_2 = backend.layer_norm_batch(&h1, &block.ln_2.weight, &block.ln_2.bias);
 
         let ffn_out = match &block.ffn {
-            FfnWeights::PerBand(w) => self.per_band_linear(w, &normed_2),
-            FfnWeights::KerrMaestro(w) => self.kerr_maestro_add(w, &normed_2),
+            FfnWeights::PerBand(w) => backend.per_band_linear(w, &normed_2),
+            FfnWeights::KerrMaestro(w) => backend.kerr_maestro_add(w, &normed_2),
         };
 
         let output: Vec<Vec<f32>> = (0..t).map(|i| {
-            let mut v = vec![0.0f32; N_EMBD];
-            for j in 0..N_EMBD { v[j] = h1[i][j] + ffn_out[i][j]; }
+            let mut v = vec![0.0f32; n_embd];
+            for j in 0..n_embd { v[j] = h1[i][j] + ffn_out[i][j]; }
             v
         }).collect();
 
@@ -232,39 +217,49 @@ impl ModelWeights {
             normed_1,
             attn_cache,
             h1,
-            ffn_input: normed_2.clone(),
             normed_2,
             output,
         }
     }
 
-    fn attention_with_cache(&self, weights: &AttentionWeights, x: &[Vec<f32>]) -> (Vec<Vec<f32>>, AttnCache) {
+    fn attention_with_cache(&self, weights: &AttentionWeights, x: &[Vec<f32>], backend: &dyn ComputeBackend) -> (Vec<Vec<f32>>, AttnCache) {
         let t = x.len();
-        let scale = 1.0 / (HEAD_DIM as f32).sqrt();
+        let n_embd = x[0].len();
+        let n_head = weights.n_head;
+        let head_dim = n_embd / n_head;
+        let scale = 1.0 / (head_dim as f32).sqrt();
 
-        let mut q_all = vec![vec![0.0f32; N_EMBD]; t];
-        let mut k_all = vec![vec![0.0f32; N_EMBD]; t];
-        let mut v_all = vec![vec![0.0f32; N_EMBD]; t];
+        // Batched QKV projection: 1 call instead of T separate calls
+        let qkv_all = backend.linear_batch(&weights.c_attn.w, &weights.c_attn.b, x);
+
+        let mut q_all = vec![vec![0.0f32; n_embd]; t];
+        let mut k_all = vec![vec![0.0f32; n_embd]; t];
+        let mut v_all = vec![vec![0.0f32; n_embd]; t];
 
         for pos in 0..t {
-            let qkv = linear_fn(&weights.c_attn.w, &weights.c_attn.b, &x[pos]);
-            for i in 0..N_EMBD {
+            let qkv = &qkv_all[pos];
+            for i in 0..n_embd {
                 q_all[pos][i] = qkv[i];
-                k_all[pos][i] = qkv[N_EMBD + i];
-                v_all[pos][i] = qkv[2 * N_EMBD + i];
+                k_all[pos][i] = qkv[n_embd + i];
+                v_all[pos][i] = qkv[2 * n_embd + i];
             }
         }
 
-        let mut att_weights_all = vec![vec![vec![0.0f32; t]; t]; N_HEAD];
-        let mut out = vec![vec![0.0f32; N_EMBD]; t];
+        let mut att_weights_all = vec![vec![vec![0.0f32; t]; t]; n_head];
+        let mut out = vec![vec![0.0f32; n_embd]; t];
 
-        for head in 0..N_HEAD {
-            let offset = head * HEAD_DIM;
+        // Pre-allocate attention scratch — reused across all heads and positions
+        let mut att = vec![0.0f32; t];
+
+        for head in 0..n_head {
+            let offset = head * head_dim;
             for qi in 0..t {
-                let mut att = vec![f32::NEG_INFINITY; t];
+                // Reset to -inf for causal masking
+                for ki in 0..t { att[ki] = f32::NEG_INFINITY; }
+
                 for ki in 0..=qi {
                     let mut dot = 0.0f32;
-                    for d in 0..HEAD_DIM {
+                    for d in 0..head_dim {
                         dot += q_all[qi][offset + d] * k_all[ki][offset + d];
                     }
                     att[ki] = dot * scale;
@@ -280,9 +275,10 @@ impl ModelWeights {
                     att[ki] /= exp_sum;
                 }
 
-                att_weights_all[head][qi] = att.clone();
+                // Copy to cache (direct copy, not clone — att is reused)
+                att_weights_all[head][qi][..t].copy_from_slice(&att);
 
-                for d in 0..HEAD_DIM {
+                for d in 0..head_dim {
                     let mut sum = 0.0f32;
                     for ki in 0..=qi {
                         sum += att[ki] * v_all[ki][offset + d];
@@ -292,10 +288,9 @@ impl ModelWeights {
             }
         }
 
-        let pre_proj = out.clone();
-        let result: Vec<Vec<f32>> = out.iter()
-            .map(|o| linear_fn(&weights.c_proj.w, &weights.c_proj.b, o))
-            .collect();
+        // Batched output projection: 1 call instead of T separate calls
+        let result = backend.linear_batch(&weights.c_proj.w, &weights.c_proj.b, &out);
+        let pre_proj = out; // move, not clone — out not used after this
 
         let cache = AttnCache {
             input: x.to_vec(),
@@ -310,8 +305,14 @@ impl ModelWeights {
     // ─── Backward chain ─────────────────────────────────────────
 
     /// Full backward pass: compute gradients for all parameters.
-    pub fn backward(&self, cache: &ForwardCache, targets: &[usize]) -> (f32, GradAccum) {
+    pub fn backward(&self, cache: &ForwardCache, targets: &[usize], backend: &dyn ComputeBackend) -> (f32, GradAccum) {
+        // Timing instrumentation — set to true for backward profiling
+        const TIMING: bool = false;
+        let _bwd_start = std::time::Instant::now();
         let t = cache.tokens.len();
+        let n_embd = self.config.n_embd();
+        let n_bands = self.config.n_bands;
+        let maestro_dim = self.config.maestro_dim;
         let mut grads = GradAccum::zeros(self);
 
         // Loss: cross-entropy per position, averaged
@@ -334,26 +335,31 @@ impl ModelWeights {
         total_loss /= t as f32;
 
         // Backward through LM head (no bias)
+        let _t_lm = std::time::Instant::now();
+        // Batched: all positions in one GPU dispatch
+        let d_normed_all = backend.linear_backward_dx_batch(&d_logits, &self.lm_head);
         let mut d_hidden: Vec<Vec<f32>> = Vec::with_capacity(t);
         for pos in 0..t {
-            let (d_normed, d_lm_head) = linear_no_bias_backward(
-                &d_logits[pos], &cache.post_ln_f[pos], &self.lm_head,
+            let (d_h, d_w, d_b) = backend.layer_norm_backward(
+                &d_normed_all[pos], &cache.pre_ln_f[pos], &self.ln_f.weight,
             );
-            for i in 0..self.vocab_size {
-                for j in 0..N_EMBD {
-                    grads.lm_head[i][j] += d_lm_head[i][j];
-                }
-            }
-
-            let (d_h, d_w, d_b) = layer_norm_backward(
-                &d_normed, &cache.pre_ln_f[pos], &self.ln_f.weight,
-            );
-            for i in 0..N_EMBD {
+            for i in 0..n_embd {
                 grads.ln_f_weight[i] += d_w[i];
                 grads.ln_f_bias[i] += d_b[i];
             }
             d_hidden.push(d_h);
         }
+        // d_lm_head via batched outer product on GPU (no bias)
+        let (lm_dw, _) = backend.outer_product_accum(
+            &d_logits, &cache.post_ln_f, false,
+        );
+        for i in 0..self.vocab_size {
+            for j in 0..n_embd {
+                grads.lm_head[i][j] += lm_dw[i][j];
+            }
+        }
+
+        if TIMING { eprintln!("  lm_head bwd:     {:?}", _t_lm.elapsed()); }
 
         // Backward through blocks in reverse
         for (block_idx, block) in self.blocks.iter().enumerate().rev() {
@@ -363,14 +369,15 @@ impl ModelWeights {
             let d_ffn_out = d_hidden.clone();
             let mut d_h1 = d_hidden.clone();
 
+            let _t_ffn = std::time::Instant::now();
             // Backward through FFN
             for pos in 0..t {
                 let d_normed_2 = match (&block.ffn, &mut bg.ffn) {
                     (FfnWeights::PerBand(w), FfnGrads::PerBand {
                         band_w, band_b, out_proj_w, out_proj_b
                     }) => {
-                        let mut bands_out = vec![0.0f32; N_EMBD];
-                        for band in 0..N_BANDS {
+                        let mut bands_out = vec![0.0f32; n_embd];
+                        for band in 0..n_bands {
                             let r_in = bc.normed_2[pos][band * 2];
                             let s_in = bc.normed_2[pos][band * 2 + 1];
                             let bw = &w.band_w[band];
@@ -379,16 +386,16 @@ impl ModelWeights {
                             bands_out[band * 2 + 1] = bw[0][1] * r_in + bw[1][1] * s_in + bb[1];
                         }
 
-                        let (d_bands_out, d_op_w, d_op_b) = linear_backward(
-                            &d_ffn_out[pos], &bands_out, &w.out_proj.w,
-                        );
-                        for i in 0..N_EMBD {
-                            for j in 0..N_EMBD { out_proj_w[i][j] += d_op_w[i][j]; }
-                            out_proj_b[i] += d_op_b[i];
+                        let d_bands_out = backend.linear_backward_dx(&d_ffn_out[pos], &w.out_proj.w);
+                        // d_w[i][j] = d_y[i] * x[j], d_b[i] = d_y[i]
+                        for i in 0..n_embd {
+                            let dy_i = d_ffn_out[pos][i];
+                            for j in 0..n_embd { out_proj_w[i][j] += dy_i * bands_out[j]; }
+                            out_proj_b[i] += dy_i;
                         }
 
-                        let mut d_input = vec![0.0f32; N_EMBD];
-                        for band in 0..N_BANDS {
+                        let mut d_input = vec![0.0f32; n_embd];
+                        for band in 0..n_bands {
                             let d_out_r = d_bands_out[band * 2];
                             let d_out_s = d_bands_out[band * 2 + 1];
                             let r_in = bc.normed_2[pos][band * 2];
@@ -415,15 +422,14 @@ impl ModelWeights {
                     }) => {
                         let kerr_out = self.kerr_ode_forward(&w.kerr, &bc.normed_2[pos]);
                         let maestro_out = self.maestro_forward(&w.maestro, &bc.normed_2[pos]);
-                        let mut combined = vec![0.0f32; N_EMBD];
-                        for i in 0..N_EMBD { combined[i] = kerr_out[i] + maestro_out[i]; }
+                        let mut combined = vec![0.0f32; n_embd];
+                        for i in 0..n_embd { combined[i] = kerr_out[i] + maestro_out[i]; }
 
-                        let (d_combined, d_op_w, d_op_b) = linear_backward(
-                            &d_ffn_out[pos], &combined, &w.out_proj.w,
-                        );
-                        for i in 0..N_EMBD {
-                            for j in 0..N_EMBD { out_proj_w[i][j] += d_op_w[i][j]; }
-                            out_proj_b[i] += d_op_b[i];
+                        let d_combined = backend.linear_backward_dx(&d_ffn_out[pos], &w.out_proj.w);
+                        for i in 0..n_embd {
+                            let dy_i = d_ffn_out[pos][i];
+                            for j in 0..n_embd { out_proj_w[i][j] += dy_i * combined[j]; }
+                            out_proj_b[i] += dy_i;
                         }
 
                         let d_kerr = &d_combined;
@@ -431,7 +437,7 @@ impl ModelWeights {
 
                         let (d_kerr_input, d_gr, d_om, d_al, d_be) =
                             kerr_ode_backward(d_kerr, &bc.normed_2[pos], &w.kerr);
-                        for k in 0..N_BANDS {
+                        for k in 0..n_bands {
                             gamma_raw[k] += d_gr[k];
                             omega[k] += d_om[k];
                         }
@@ -440,17 +446,17 @@ impl ModelWeights {
 
                         let (d_maestro_input, d_sq, d_pr) =
                             maestro_backward(d_maestro, &bc.normed_2[pos], &w.maestro);
-                        for i in 0..MAESTRO_DIM {
-                            for j in 0..N_EMBD { squeeze_w[i][j] += d_sq.d_w[i][j]; }
+                        for i in 0..maestro_dim {
+                            for j in 0..n_embd { squeeze_w[i][j] += d_sq.d_w[i][j]; }
                             squeeze_b[i] += d_sq.d_b[i];
                         }
-                        for i in 0..N_EMBD {
-                            for j in 0..MAESTRO_DIM { process_w[i][j] += d_pr.d_w[i][j]; }
+                        for i in 0..n_embd {
+                            for j in 0..maestro_dim { process_w[i][j] += d_pr.d_w[i][j]; }
                             process_b[i] += d_pr.d_b[i];
                         }
 
-                        let mut d_input = vec![0.0f32; N_EMBD];
-                        for i in 0..N_EMBD {
+                        let mut d_input = vec![0.0f32; n_embd];
+                        for i in 0..n_embd {
                             d_input[i] = d_kerr_input[i] + d_maestro_input[i];
                         }
                         d_input
@@ -458,83 +464,85 @@ impl ModelWeights {
                     _ => unreachable!(),
                 };
 
-                let (d_h1_from_ln2, d_w, d_b) = layer_norm_backward(
+                let (d_h1_from_ln2, d_w, d_b) = backend.layer_norm_backward(
                     &d_normed_2, &bc.h1[pos], &block.ln_2.weight,
                 );
-                for i in 0..N_EMBD {
+                for i in 0..n_embd {
                     bg.ln_2_weight[i] += d_w[i];
                     bg.ln_2_bias[i] += d_b[i];
                     d_h1[pos][i] += d_h1_from_ln2[i];
                 }
             }
 
+            if TIMING && block_idx == 0 { eprintln!("    ffn+ln2 bwd:   {:?}", _t_ffn.elapsed()); }
+
             // Backward through attention
             let d_attn_out = d_h1.clone();
 
-            let mut d_pre_proj = Vec::with_capacity(t);
-            for pos in 0..t {
-                let (d_pp, d_w, d_b) = linear_backward(
-                    &d_attn_out[pos], &bc.attn_cache.pre_proj[pos], &block.attn.c_proj.w,
-                );
-                for i in 0..N_EMBD {
-                    for j in 0..N_EMBD { bg.attn_c_proj_w[i][j] += d_w[i][j]; }
-                    bg.attn_c_proj_b[i] += d_b[i];
-                }
-                d_pre_proj.push(d_pp);
+            let _t_cproj = std::time::Instant::now();
+            // Batched: all positions in one GPU dispatch
+            let d_pre_proj = backend.linear_backward_dx_batch(&d_attn_out, &block.attn.c_proj.w);
+            let (cp_dw, cp_db) = backend.outer_product_accum(
+                &d_attn_out, &bc.attn_cache.pre_proj, true,
+            );
+            for i in 0..n_embd {
+                for j in 0..n_embd { bg.attn_c_proj_w[i][j] += cp_dw[i][j]; }
+                bg.attn_c_proj_b[i] += cp_db[i];
             }
+            if TIMING && block_idx == 0 { eprintln!("    c_proj bwd:    {:?}", _t_cproj.elapsed()); }
 
-            let mut d_q = vec![vec![0.0f32; N_EMBD]; t];
-            let mut d_k = vec![vec![0.0f32; N_EMBD]; t];
-            let mut d_v = vec![vec![0.0f32; N_EMBD]; t];
+            let _t_attn = std::time::Instant::now();
+            let n_head = bc.attn_cache.att_weights.len();
+            let (d_q, d_k, d_v) = backend.attention_backward(
+                &d_pre_proj,
+                &bc.attn_cache.q_all,
+                &bc.attn_cache.k_all,
+                &bc.attn_cache.v_all,
+                &bc.attn_cache.att_weights,
+                n_head,
+            );
+            if TIMING && block_idx == 0 { eprintln!("    attn bwd:      {:?}", _t_attn.elapsed()); }
 
+            let _t_cattn = std::time::Instant::now();
+            // Concatenate d_q, d_k, d_v into d_qkv[pos][3*n_embd]
+            let mut d_qkv_all = Vec::with_capacity(t);
             for pos in 0..t {
-                attention_backward_single(
-                    &d_pre_proj[pos],
-                    &bc.attn_cache.q_all,
-                    &bc.attn_cache.k_all,
-                    &bc.attn_cache.v_all,
-                    &bc.attn_cache.att_weights.iter()
-                        .map(|h| h[pos].clone()).collect::<Vec<_>>(),
-                    pos,
-                    &mut d_q, &mut d_k, &mut d_v,
-                );
-            }
-
-            let mut d_normed_1 = vec![vec![0.0f32; N_EMBD]; t];
-            for pos in 0..t {
-                let mut d_qkv = vec![0.0f32; 3 * N_EMBD];
-                for i in 0..N_EMBD {
+                let mut d_qkv = vec![0.0f32; 3 * n_embd];
+                for i in 0..n_embd {
                     d_qkv[i] = d_q[pos][i];
-                    d_qkv[N_EMBD + i] = d_k[pos][i];
-                    d_qkv[2 * N_EMBD + i] = d_v[pos][i];
+                    d_qkv[n_embd + i] = d_k[pos][i];
+                    d_qkv[2 * n_embd + i] = d_v[pos][i];
                 }
-
-                let (d_x, d_w, d_b) = linear_backward(
-                    &d_qkv, &bc.attn_cache.input[pos], &block.attn.c_attn.w,
-                );
-                for i in 0..3 * N_EMBD {
-                    for j in 0..N_EMBD { bg.attn_c_attn_w[i][j] += d_w[i][j]; }
-                    bg.attn_c_attn_b[i] += d_b[i];
-                }
-                d_normed_1[pos] = d_x;
+                d_qkv_all.push(d_qkv);
             }
+            // Batched: all positions in one GPU dispatch
+            let d_normed_1 = backend.linear_backward_dx_batch(&d_qkv_all, &block.attn.c_attn.w);
+            let (ca_dw, ca_db) = backend.outer_product_accum(
+                &d_qkv_all, &bc.attn_cache.input, true,
+            );
+            for i in 0..3 * n_embd {
+                for j in 0..n_embd { bg.attn_c_attn_w[i][j] += ca_dw[i][j]; }
+                bg.attn_c_attn_b[i] += ca_db[i];
+            }
+            if TIMING && block_idx == 0 { eprintln!("    c_attn bwd:    {:?}", _t_cattn.elapsed()); }
 
             // Backward through LN1
             d_hidden = Vec::with_capacity(t);
             for pos in 0..t {
-                let (d_input, d_w, d_b) = layer_norm_backward(
+                let (d_input, d_w, d_b) = backend.layer_norm_backward(
                     &d_normed_1[pos], &bc.input[pos], &block.ln_1.weight,
                 );
-                for i in 0..N_EMBD {
+                for i in 0..n_embd {
                     bg.ln_1_weight[i] += d_w[i];
                     bg.ln_1_bias[i] += d_b[i];
                 }
                 let mut d_h = d_input;
-                for i in 0..N_EMBD { d_h[i] += d_h1[pos][i]; }
+                for i in 0..n_embd { d_h[i] += d_h1[pos][i]; }
                 d_hidden.push(d_h);
             }
         }
 
+        if TIMING { eprintln!("  TOTAL bwd:       {:?}", _bwd_start.elapsed()); }
         (total_loss, grads)
     }
 }

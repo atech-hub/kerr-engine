@@ -92,7 +92,7 @@ pub fn load_weights(path: &str) -> io::Result<ModelWeights> {
         let ln_1 = r.read_layernorm(N_EMBD)?;
         let c_attn = r.read_linear(3 * N_EMBD, N_EMBD)?;
         let c_proj = r.read_linear(N_EMBD, N_EMBD)?;
-        let attn = AttentionWeights { c_attn, c_proj };
+        let attn = AttentionWeights { c_attn, c_proj, n_head: N_HEAD };
         let ln_2 = r.read_layernorm(N_EMBD)?;
 
         let ffn = if i == 0 {
@@ -120,7 +120,7 @@ pub fn load_weights(path: &str) -> io::Result<ModelWeights> {
             let omega = r.read_f32_vec(N_BANDS)?;
             let alpha = r.read_f32()?;
             let beta = r.read_f32()?;
-            let kerr = KerrWeights { gamma_raw, omega, alpha, beta };
+            let kerr = KerrWeights { gamma_raw, omega, alpha, beta, rk4_n_steps: RK4_N_STEPS };
 
             let squeeze = r.read_linear(MAESTRO_DIM, N_EMBD)?;
             let process_1 = r.read_linear(N_EMBD, MAESTRO_DIM)?;
@@ -143,6 +143,7 @@ pub fn load_weights(path: &str) -> io::Result<ModelWeights> {
     println!("  Weights loaded successfully.");
 
     Ok(ModelWeights {
+        config: ModelConfig::default_128(),
         vocab_size,
         wte_phase,
         wpe,

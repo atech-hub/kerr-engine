@@ -1,13 +1,13 @@
-# CLAUDE.md — Kerr Engine Internal Reference
+# CLAUDE.md — Kerr Engine Developer Reference
 
-> Internal developer docs for Claude Code. Terse, factual, no narrative.
-> Last updated: 2026-03-12 (end of Chat 6)
+> Developer documentation for the Kerr Engine codebase. Module map, shader inventory, validation gates, benchmarks, and architectural decisions.
+> Last updated: 2026-03-13
 
 ---
 
 ## What this is
 
-Pure Rust inference and training engine for the Kerr-ODE architecture from the Wave Coherence project. No Python, no PyTorch, no CUDA toolkit. Dependencies: wgpu, bytemuck, pollster.
+Pure Rust inference and training engine for the Kerr-ODE architecture from the Wave Coherence project. No Python, no PyTorch, no CUDA toolkit. Dependencies: wgpu, bytemuck, pollster, mimalloc.
 
 Parent project: github.com/atech-hub/Wave-Coherence-as-a-Computational-Primitive (public, MIT).
 This repo: private. Contains implementation IP, not research findings.
@@ -43,15 +43,15 @@ This repo: private. Contains implementation IP, not research findings.
 
 | Module | Lines | Role |
 |---|---|---|
-| `gpu_backend.rs` | 884 | `GpuBackend` implementing `ComputeBackend` (per-call pattern). All 8 trait methods. Validation harness + per-primitive benchmark (CPU vs GPU timing). Per-call pattern: ~500us dispatch overhead per operation. |
+| `gpu_backend.rs` | 1497 | `GpuBackend` implementing `ComputeBackend`. All forward + backward trait methods. 11 shader pipelines (6 forward, 5 backward). Validation harness + per-primitive benchmark. Per-call pattern: ~500us dispatch overhead per operation; batched methods amortise this across positions. |
 | `gpu_persistent.rs` | 720 | `GpuPersistent` — persistent buffer pipeline. Weights uploaded once, scratch buffers pre-allocated, single command encoder submit, single readback. Fused RK4 Kerr-ODE (8 dispatches vs 32). Benchmark: 296x faster than per-call GPU. Still 11-18x slower than CPU at 128-dim. Crossover: ~700-800 dim. |
-| `pipeline.rs` | 540 | Cached forward pass (saves activations for backward) + full backward chain that orchestrates primitives from backward.rs. Cache structs (ForwardCache, BlockCache, AttnCache). GradAccum struct. The contract: what forward saves, backward consumes. |
-| `backward.rs` | 530 | Gradient primitives: linear, layer_norm, GELU, softplus, cross-entropy, Kerr-ODE derivative backward, RK4 step backward, full Kerr-ODE backward, attention backward, maestro backward. All hand-derived, no autograd. |
-| `model.rs` | 498 | Weight structs, architecture constants, inference-only forward pass, Kerr-ODE forward, maestro forward, attention, per-band linear, RK4 integration, harmonic table construction. Source of truth for what the computation is. |
-| `train.rs` | 361 | Training loop orchestration. CurriculumSchedule (configurable band scheduling). TrainConfig. Parallel batch forward/backward via std::thread::scope. Loss logging, periodic eval (val loss + text generation), JSON training summary, checkpoint save at intervals. |
-| `optim.rs` | 299 | Adam optimizer with bias correction. Parameter flatten/unflatten (structured weights ↔ flat f32 vec). Gradient flattening. Gradient norm clipping. `count_params`. Checkpoint support (from_checkpoint, checkpoint_state). |
-| `backend.rs` | 228 | `ComputeBackend` trait (8 methods: linear, linear_no_bias, layer_norm, kerr_ode, maestro, attention, per_band_linear, kerr_maestro_add). `CpuBackend` implementation. |
-| `main.rs` | 225 | CLI dispatch. Five subcommands (see below). Stage 1/2 validation logic lives here temporarily. |
+| `pipeline.rs` | 548 | Cached forward pass routing through `ComputeBackend`. Full backward chain: attention backward, linear backward dx (batched), outer product accumulation, layer norm backward all dispatched through trait. FFN backward (Kerr-ODE + maestro) remains per-position on CPU. Timing instrumentation (TIMING const, disabled by default). Cache structs (ForwardCache, BlockCache, AttnCache). GradAccum struct. |
+| `backward.rs` | 554 | Gradient primitives: linear, layer_norm, GELU, softplus, cross-entropy, Kerr-ODE derivative backward, RK4 step backward, full Kerr-ODE backward, attention backward, maestro backward. All hand-derived, no autograd. linear_backward_dx_only for trait dispatch. |
+| `model.rs` | 573 | Weight structs, ModelConfig (runtime-configurable architecture), inference-only forward pass, Kerr-ODE forward, maestro forward, attention, per-band linear, RK4 integration, harmonic table construction. All forward ops derive dimensions from config/data (no hardcoded constants). Iterator-based linear for autovectorisation. |
+| `train.rs` | 408 | Training loop orchestration. Creates backend at startup via `backend::auto_select(n_embd)`. CurriculumSchedule (configurable band scheduling). TrainConfig with all CLI-configurable fields including ModelConfig overrides. Parallel batch forward/backward via std::thread::scope. generate() routes through ComputeBackend. Loss logging, periodic eval (val loss + text generation), JSON training summary, checkpoint save at intervals. Vocab resize on cross-corpus resume. |
+| `optim.rs` | 305 | Adam optimizer with bias correction. Parameter flatten/unflatten (structured weights ↔ flat f32 vec). Gradient flattening. Gradient norm clipping. `count_params`. Checkpoint support (from_checkpoint, checkpoint_state). Extend for vocab resize. |
+| `backend.rs` | 476 | `ComputeBackend` trait (8 forward + 3 batch forward + 6 backward methods). `CpuBackend` implementation. Auto-select logic (CPU below 768-dim, GPU above). Backward methods: linear_backward_dx, linear_backward_dx_batch, layer_norm_backward, gelu_backward, outer_product_accum, attention_backward. |
+| `main.rs` | 271 | CLI dispatch with full flag parsing (--seed, --train-seed, --threads, --cpu, --gpu, --resume, --word, --no-curriculum). Stage 1/2 validation logic lives here temporarily. mimalloc global allocator. |
 | `gpu.rs` | 209 | WGPU device setup for Stage 1 validation (single Euler step). Retained for backward compatibility. |
 | `data.rs` | 203 | Dataset with train/val split (90/10). Character-level and word-level tokenization. Word tokenizer: whitespace split, lowercase, punctuation separation, min_count threshold. |
 | `grad_test.rs` | 184 | Stage 3 gradient validation harness. Loads PyTorch reference gradients, compares against Rust analytical gradients. |
@@ -60,35 +60,46 @@ This repo: private. Contains implementation IP, not research findings.
 | `init.rs` | 110 | Weight initialization from scratch. Matches PyTorch defaults (uniform ±1/√fan_in). Kerr params: γ_raw=softplus⁻¹(0.1), ω=k/N linearly spaced, α=β=0.1. |
 | `rng.rs` | 45 | Deterministic xorshift64 PRNG. Seeded, reproducible. state()/from_state() for checkpointing. |
 
-**Total: 5,361 lines across 16 modules.**
+**Total: 6,525 lines across 16 modules.**
 
-**Shaders:**
+**Shaders (11 WGSL compute shaders):**
 | File | Role |
 |---|---|
 | `shaders/matvec.wgsl` | Matrix-vector multiply: y = W @ x + b. One thread per output row, workgroup size 64. Uniform flag for bias/no-bias. |
-| `shaders/layer_norm.wgsl` | Layer normalization via parallel tree reduction in shared memory. Single workgroup of 128 threads. Two-pass: mean+variance reduction, then normalize. |
+| `shaders/layer_norm.wgsl` | Layer normalization via strided parallel reduction. Workgroup size 256, supports up to 2048-dim. |
 | `shaders/kerr_step.wgsl` | One Kerr-ODE derivative evaluation. Neighbour coupling via [1,1,0,1,1] stencil. One thread per band. Workgroup size 64. |
-| `shaders/kerr_rk4_step.wgsl` | Fused RK4 step — all 4 derivative evaluations + combination in a single dispatch. Uses workgroup shared memory for neighbour synchronisation between sub-steps. 32 round-trips → 1 dispatch. |
+| `shaders/kerr_rk4_step.wgsl` | Fused RK4 step — all 4 derivative evaluations + combination in a single dispatch. Workgroup size 256, supports up to 256 bands (512-dim). Falls back to kerr_step.wgsl for larger. |
 | `shaders/gelu.wgsl` | Element-wise GELU activation. One thread per element. |
 | `shaders/vec_add.wgsl` | Element-wise vector addition. One thread per element. |
+| `shaders/matvec_backward.wgsl` | d_x = W^T @ d_y (single position). One thread per input element, workgroup size 64. |
+| `shaders/matvec_backward_batch.wgsl` | Batched d_x[pos] = W^T @ d_y[pos] for all positions. One thread per (pos, j). Eliminates per-position dispatch overhead — **28x speedup** over per-position dispatch at 768-dim. |
+| `shaders/layer_norm_backward.wgsl` | Full layer norm backward: d_x, d_weight, d_bias. Strided workgroup reduction matching forward pattern. |
+| `shaders/gelu_backward.wgsl` | Element-wise GELU gradient. Ready for FFN backward restructuring. |
+| `shaders/attn_backward_scores.wgsl` | Attention backward Phase 1: d_score (softmax backward) + d_q. One workgroup per (pos, head). Shared memory reduction for softmax Jacobian. |
+| `shaders/attn_backward_dkv.wgsl` | Attention backward Phase 2: d_k + d_v from d_score. One thread per (ki, d_global). No race conditions — each thread writes unique element. |
+| `shaders/outer_product.wgsl` | Batched outer product: d_w[i][j] = sum_pos d_y[pos][i] * x[pos][j]. One workgroup per row. Also computes d_b. Replaces CPU weight gradient accumulation. |
 
 ---
 
-## CLI commands
+## CLI quick reference
+
+Full CLI documentation with examples is in README.md. This is the quick reference for Claude Code sessions.
 
 ```
-kerr-engine gpu-test                                    # Stage 1: single Euler step, CPU vs GPU
-kerr-engine gpu-backend-test                            # GPU backend: validate all primitives vs CPU
-kerr-engine gpu-bench                                   # Per-primitive CPU vs GPU timing (per-call)
-kerr-engine gpu-persistent-bench                        # Persistent GPU pipeline vs per-call vs CPU
-kerr-engine validate <model.bin>                        # Stage 2: full forward pass, Rust vs Python
-kerr-engine grad-test [gradient_test.bin]               # Stage 3: analytical gradients vs PyTorch autograd
-kerr-engine train [data] [iters] [batch] [seq] [lr] [--no-curriculum] [--word] [--resume FILE]
+kerr-engine gpu-test                   # Stage 1 validation
+kerr-engine gpu-backend-test           # GPU primitives vs CPU
+kerr-engine gpu-bench                  # Per-primitive timing
+kerr-engine gpu-persistent-bench       # Persistent pipeline timing
+kerr-engine validate <model.bin>       # Stage 2 validation
+kerr-engine grad-test [gradient.bin]   # Stage 3 validation
+kerr-engine train [data] [iters] [batch] [seq] [lr] [flags]
 ```
 
-Default training: `kerr-engine train data/input.txt 3000 4 64 3e-4`
-Word-level: `kerr-engine train data/input.txt 3000 4 64 3e-4 --word`
-Resume: `kerr-engine train data/input.txt 3000 4 64 3e-4 --resume checkpoint_iter500.bin`
+**Training flags:** `--seed N`, `--train-seed N`, `--threads N`, `--cpu`, `--gpu`, `--gpu-device N`, `--no-curriculum`, `--word`, `--resume FILE`, `--n-bands N`, `--n-head N`, `--n-layers N`, `--maestro-dim N`, `--block-size N`, `--rk4-steps N`
+
+**Other commands:** `list-gpus` — enumerate available GPU adapters
+
+All defaults are sensible. Nothing hardcoded. See README.md for full descriptions and examples.
 
 ---
 
@@ -127,13 +138,13 @@ Seeds: model init = 42, training RNG = 1337. Both must match for character-ident
 
 | | Python (PyTorch + RTX 4070 Ti) | Rust (CPU, 4 threads) |
 |---|---|---|
-| Total time | ~10 min | 4 min 40 sec |
-| Median iter | ~200 ms | ~71 ms |
+| Total time | ~10 min | ~3 min 50 sec (est. from 200-iter scaling + eval overhead) |
+| Median iter | ~200 ms | ~62 ms |
 | Final train loss | ~2.0 | 1.97 |
 | Final val loss | ~2.1 | 2.12 |
 | Hardware | RTX 4070 Ti (CUDA) | i7-14700K (4 of 28 threads) |
 
-**2.1x faster on CPU only.** Same convergence, same final loss. Framework overhead (Python interpreter, autograd tape, CUDA kernel launch, tensor metadata) exceeds the GPU compute advantage at this scale.
+**~2.6x faster on CPU only after optimisation (was 2.1x before mimalloc + iterators + clone elimination).** Same convergence, same final loss. Framework overhead (Python interpreter, autograd tape, CUDA kernel launch, tensor metadata) exceeds the GPU compute advantage at this scale. Total optimisation: 20% over unoptimised Rust baseline (15.3s → 12.2s for 200 iters). All gains bit-identical.
 
 ## GPU benchmark: per-call vs persistent vs CPU (128-dim)
 
@@ -149,13 +160,17 @@ Persistent is 296x faster than per-call for Kerr-ODE. CPU still wins at 128-dim.
 
 ## Known technical debt
 
-1. **Three-copy duplication.** `model.rs`, `pipeline.rs`, and `backend.rs`/`gpu_backend.rs` each implement some of the same operations (attention, kerr_ode, maestro, linear). Now that GpuBackend exists and is validated, the next step is to wire inference (model.rs) and training (pipeline.rs) to dispatch through `ComputeBackend` rather than calling their own copies. This unification is the gate to GPU-accelerated training.
+1. ~~**Three-copy duplication**~~ **RESOLVED for training.** pipeline.rs now routes through `ComputeBackend` trait. Inline math helpers removed. The remaining separate implementation in model.rs is the inference-only forward pass — intentionally kept independent as the Stage 2 validation reference. Do not unify model.rs; it's a safety net, not debt.
 
 2. **flatten/unflatten fragility.** `optim.rs` has flatten_params, unflatten_params, and flatten_grads that must stay in lockstep. Adding any new parameter type requires updating all three in the same order. No automatic derivation. Test after any architecture change.
 
-3. **Attention backward per-position.** `attention_backward_single` in backward.rs processes one query position at a time. Works correctly but O(T²) with high constant. Batching the backward across positions would help when sequence length grows.
+3. ~~**Attention backward per-position.**~~ **RESOLVED.** GPU attention backward shader (2-dispatch) processes all positions in parallel. 4ms at 768-dim. CpuBackend still uses per-position fallback.
 
-4. **Stage 1/2 validation code in main.rs.** Should move to a validation module. Low priority.
+4. **FFN backward per-position.** Kerr-ODE backward + maestro backward run per-position on CPU (~340ms/block at 768-dim). Batching requires restructuring to collect forward intermediates first, then dispatch. The Kerr-ODE derivative backward is the complex piece.
+
+5. **gpu_backend.rs size.** At 1497 lines, needs splitting. Benchmark/validation code (~300 lines) should move to gpu_bench.rs.
+
+6. **Stage 1/2 validation code in main.rs.** Should move to a validation module. Low priority.
 
 ---
 
@@ -169,24 +184,53 @@ Persistent is 296x faster than per-call for Kerr-ODE. CPU still wins at 128-dim.
 | Eval loop (validation loss) | train.rs | DONE — fixed-seed val loss, text generation |
 | Word-level tokenizer | data.rs | DONE — whitespace split, min_count, <unk> |
 | Training summary (JSON) | train.rs | DONE — config + loss curves + timing |
-| GPU backend (hybrid tier) | gpu_backend.rs | DONE — 3 shaders, all 8 trait methods, validated |
-| Wire GpuBackend into inference/training | pipeline.rs + train.rs | Next — replace CPU dispatch with GPU |
-| Full-GPU attention shader | shaders/ | Future — fused QKV + softmax in WGSL |
+| GPU backend (forward) | gpu_backend.rs | DONE — 6 forward shaders, all 8 trait methods, validated |
+| GPU backward shaders | gpu_backend.rs + shaders/ | DONE — 5 backward shaders: matvec_backward, matvec_backward_batch, layer_norm_backward, attn_backward (2-dispatch), outer_product, gelu_backward. Attention backward 4ms on GPU. Batched matvec 28x speedup. |
+| ModelConfig refactor | model.rs, pipeline.rs | DONE — runtime-configurable n_bands, n_head, n_layers, maestro_dim, block_size, rk4_steps. All forward ops derive from config/data. |
+| Multi-GPU selection | gpu_backend.rs, main.rs | DONE — `list-gpus` command, `--gpu-device N` flag, `with_device_index(idx)` constructor |
+| generate() GPU routing | train.rs | DONE — inference routes through ComputeBackend via forward_with_cache() |
+| Wire GpuBackend into training pipeline | pipeline.rs + train.rs | DONE — auto_select at startup, ComputeBackend dispatch |
+| Wire GpuBackend into inference (model.rs) | model.rs | Deferred — model.rs kept as independent validation reference |
+| Batch parallelism (std::thread::scope) | train.rs | DONE — 3.4x speedup |
+| Progressive curriculum (band scheduling) | train.rs | DONE — configurable CurriculumSchedule |
+| Checkpoint save/load | checkpoint.rs | DONE — binary KCHK format, bit-perfect resume |
+| Eval loop (validation loss) | train.rs | DONE — fixed-seed val loss, text generation |
+| Word-level tokenizer | data.rs | DONE — whitespace split, min_count, <unk> |
+| Training summary (JSON) | train.rs | DONE — config + loss curves + timing |
+| Sub-batch CPU parallelism (per-head, per-position) | pipeline.rs | NOT VIABLE at 128-dim — thread spawn overhead (~10μs) exceeds per-op compute (~1-10μs). Revisit at larger dims. |
+| mimalloc allocator | Cargo.toml | DONE — ~10% gain from reduced 4-thread Windows heap contention |
+| Clone elimination (4 redundant copies) | pipeline.rs | DONE — ~5% from removing output, ffn_input, pre_proj, pre_ln_f copies never read by backward |
+| Iterator-based dot products | pipeline.rs, backend.rs | DONE — ~3-5% from bounds check elimination + better LLVM autovectorisation |
+| Explicit +avx2,+fma target features | .cargo/config.toml | DONE — small gain, workaround for rust-lang/rust#147176 (target-cpu=native detection bug) |
+| Pre-allocated attention scratch | pipeline.rs | DONE — ~1% from eliminating 1024 Vec allocations per batch element |
+| Batched linear operations | backend.rs | NO IMPACT at 128-dim — matrices already fit in L1 cache |
+| FFN backward GPU batching | pipeline.rs, shaders/ | Future — requires restructuring Kerr-ODE + maestro backward to batch across positions. ~340ms/block remaining bottleneck. |
 | Corpus data loading (multi-corpus) | data.rs | Future — for corpus texture experiments |
 
 ## Compute tiers
 
 | Tier | Implementation | Status |
 |---|---|---|
-| CPU | `CpuBackend` in backend.rs | Operational. All 8 methods. Used by training loop. |
-| Hybrid | `GpuBackend` in gpu_backend.rs | Operational. Linear/layer_norm/kerr_ode on GPU, attention scores + GELU + small ops on CPU. Validated against CpuBackend. |
-| Full-GPU | Not yet | Would need fused attention kernel + GELU shader. Not needed until sequence length grows. |
+| CPU | `CpuBackend` in backend.rs | Operational. All forward + backward methods. Bit-identical baseline validated. |
+| GPU | `GpuBackend` in gpu_backend.rs | Operational. Forward: linear/layer_norm/kerr_ode on GPU. Backward: attention backward (2-dispatch), batched linear_backward_dx, outer_product_accum, layer_norm_backward all on GPU. FFN backward (Kerr-ODE + maestro) remains per-position CPU. Activates at N_EMBD >= 768. |
 
-Next step: wire `GpuBackend` into the inference forward pass (model.rs) or training pipeline (pipeline.rs) so it actually runs during training, not just validation.
+Training pipeline dispatches through `ComputeBackend`. auto_select picks backend at startup based on N_EMBD. Inference routes through backend via `forward_with_cache()`. model.rs forward kept independent as Stage 2 validation reference.
+
+**GPU backward profiling (768-dim, 12M params, RTX 4070 Ti):**
+
+| Operation | Before batching | After batching | Speedup |
+|---|---|---|---|
+| c_proj backward | ~200ms | ~7ms | 28x |
+| c_attn backward | ~400ms | ~14ms | 28x |
+| attention backward | CPU ~400ms (est.) | GPU 4ms | ~100x |
+| FFN+LN2 backward | ~340ms | ~340ms | (still CPU) |
+| Total backward | ~4.4s | ~2.2s | 2x |
+
+Remaining bottleneck: FFN backward (~340ms/block) — Kerr-ODE analytical derivatives + maestro backward + per-position outer products. Requires restructuring to batch across positions.
 
 **Module growth targets (do not exceed without splitting):**
 
-No module over 900 lines. gpu_backend.rs is at 884 (includes benchmark code). If it grows further, split benchmark into gpu_bench.rs.
+gpu_backend.rs is at 1497 (includes benchmark + 11 pipeline compilations + all dispatch methods). Split into gpu_backend.rs (pipelines + dispatch) and gpu_bench.rs (validation + benchmark) when it next needs major changes.
 
 ---
 
@@ -207,18 +251,18 @@ RK4 integrates this 8 times per layer at dt=0.125. Maestro adds a global synchro
 
 ---
 
-## Three-way collaboration model
+## Collaboration model
 
-- **Marco:** Direction, pattern recognition, go/no-go decisions. Sees form, not equations.
-- **Claude Desktop (Opus):** Theory, analysis, documentation, math derivations, investigation design.
-- **Claude Code:** Implementation, testing, repo management, reality checks on Desktop overclaims.
+- **Marco Da Cunha:** Direction, pattern recognition, architecture decisions
+- **Claude Desktop (Opus):** Theory, analysis, documentation, mathematical derivations
+- **Claude Code:** Implementation, testing, validation, repository management
 
-Rules: Honesty over flattery. Every null documented. Nothing publishes without test results. When Code corrects an interpretation, accept it. Marco's infrastructure instincts drive architecture decisions — don't second-guess them.
+Every null result is documented alongside positives. Nothing publishes without test results. See README.md for full credits.
 
 ---
 
-## Do NOT re-litigate
+## Closed investigations
 
-These are closed decisions from the parent project. Do not revisit:
+These architectural decisions have been tested and resolved in the parent project. See the parent repo's investigation docs for full experimental results.
 
-φ_eff formula (CLOSED), Jessop citation (REMOVED), dispersive coupling (NULL), harmonic attention Q/K (HURTS), per-band alpha/beta (NEGLIGIBLE), band routing (HURTS), multiplicative fusion (HURTS), 9-band+curriculum (DON'T STACK), curriculum at <48 bands (HURTS), two-stage without curriculum (NEGLIGIBLE), wave transduction (PARKED — safety), slow bands=identity (NULL), higher freq=smarter (NULL).
+φ_eff formula (closed), dispersive coupling (null), harmonic attention Q/K (hurts performance), per-band alpha/beta (negligible), band routing (hurts performance), multiplicative fusion (hurts performance), 9-band+curriculum (don't stack), curriculum below 48 bands (hurts), two-stage without curriculum (negligible), slow bands as identity carriers (null), higher frequency equals higher intelligence (null).

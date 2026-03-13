@@ -47,6 +47,12 @@ impl Adam {
         (self.t, &self.m, &self.v)
     }
 
+    /// Extend m/v vectors with zeros for new parameters (e.g. vocab resize).
+    pub fn extend(&mut self, extra: usize) {
+        self.m.extend(std::iter::repeat(0.0f32).take(extra));
+        self.v.extend(std::iter::repeat(0.0f32).take(extra));
+    }
+
     /// Step: update params in-place given gradients.
     pub fn step(&mut self, params: &mut [f32], grads: &[f32]) {
         self.t += 1;
@@ -75,60 +81,66 @@ pub fn clip_grad_norm(grads: &mut [f32], max_norm: f32) {
 
 // ─── Parameter count ──────────────────────────────────────────
 
-/// Count params from vocab_size alone (architecture is fixed).
-pub fn count_params_for_vocab(vocab_size: usize) -> usize {
+/// Count params from vocab_size and config.
+pub fn count_params_for_vocab(vocab_size: usize, config: &ModelConfig) -> usize {
+    let n_embd = config.n_embd();
+    let n_bands = config.n_bands;
+    let maestro_dim = config.maestro_dim;
     let mut n = 0;
 
     // Block 0: PerBandLinear
-    n += N_EMBD * 2; // ln_1
-    n += 3 * N_EMBD * N_EMBD + 3 * N_EMBD; // c_attn
-    n += N_EMBD * N_EMBD + N_EMBD; // c_proj
-    n += N_EMBD * 2; // ln_2
-    n += N_BANDS * 4 + N_BANDS * 2; // band_w + band_b
-    n += N_EMBD * N_EMBD + N_EMBD; // out_proj
+    n += n_embd * 2; // ln_1
+    n += 3 * n_embd * n_embd + 3 * n_embd; // c_attn
+    n += n_embd * n_embd + n_embd; // c_proj
+    n += n_embd * 2; // ln_2
+    n += n_bands * 4 + n_bands * 2; // band_w + band_b
+    n += n_embd * n_embd + n_embd; // out_proj
 
-    // Blocks 1-3: KerrMaestro
-    for _ in 0..3 {
-        n += N_EMBD * 2; // ln_1
-        n += 3 * N_EMBD * N_EMBD + 3 * N_EMBD; // c_attn
-        n += N_EMBD * N_EMBD + N_EMBD; // c_proj
-        n += N_EMBD * 2; // ln_2
-        n += N_BANDS + N_BANDS + 1 + 1; // gamma_raw, omega, alpha, beta
-        n += MAESTRO_DIM * N_EMBD + MAESTRO_DIM; // squeeze
-        n += N_EMBD * MAESTRO_DIM + N_EMBD; // process
-        n += N_EMBD * N_EMBD + N_EMBD; // out_proj
+    // Blocks 1-(n_layers-1): KerrMaestro
+    for _ in 0..(config.n_layers - 1) {
+        n += n_embd * 2; // ln_1
+        n += 3 * n_embd * n_embd + 3 * n_embd; // c_attn
+        n += n_embd * n_embd + n_embd; // c_proj
+        n += n_embd * 2; // ln_2
+        n += n_bands + n_bands + 1 + 1; // gamma_raw, omega, alpha, beta
+        n += maestro_dim * n_embd + maestro_dim; // squeeze
+        n += n_embd * maestro_dim + n_embd; // process
+        n += n_embd * n_embd + n_embd; // out_proj
     }
 
-    n += N_EMBD * 2; // ln_f
-    n += vocab_size * N_EMBD; // lm_head
+    n += n_embd * 2; // ln_f
+    n += vocab_size * n_embd; // lm_head
     n
 }
 
 pub fn count_params(model: &ModelWeights) -> usize {
+    let n_embd = model.config.n_embd();
+    let n_bands = model.config.n_bands;
+    let maestro_dim = model.config.maestro_dim;
     let mut n = 0;
 
     for block in &model.blocks {
-        n += N_EMBD * 2; // ln_1 weight + bias
-        n += 3 * N_EMBD * N_EMBD + 3 * N_EMBD; // c_attn
-        n += N_EMBD * N_EMBD + N_EMBD; // c_proj
-        n += N_EMBD * 2; // ln_2 weight + bias
+        n += n_embd * 2; // ln_1 weight + bias
+        n += 3 * n_embd * n_embd + 3 * n_embd; // c_attn
+        n += n_embd * n_embd + n_embd; // c_proj
+        n += n_embd * 2; // ln_2 weight + bias
 
         match &block.ffn {
             FfnWeights::PerBand(_) => {
-                n += N_BANDS * 4 + N_BANDS * 2; // band_w + band_b
-                n += N_EMBD * N_EMBD + N_EMBD; // out_proj
+                n += n_bands * 4 + n_bands * 2; // band_w + band_b
+                n += n_embd * n_embd + n_embd; // out_proj
             }
             FfnWeights::KerrMaestro(_) => {
-                n += N_BANDS + N_BANDS + 1 + 1; // gamma_raw, omega, alpha, beta
-                n += MAESTRO_DIM * N_EMBD + MAESTRO_DIM; // squeeze
-                n += N_EMBD * MAESTRO_DIM + N_EMBD; // process
-                n += N_EMBD * N_EMBD + N_EMBD; // out_proj
+                n += n_bands + n_bands + 1 + 1; // gamma_raw, omega, alpha, beta
+                n += maestro_dim * n_embd + maestro_dim; // squeeze
+                n += n_embd * maestro_dim + n_embd; // process
+                n += n_embd * n_embd + n_embd; // out_proj
             }
         }
     }
 
-    n += N_EMBD * 2; // ln_f
-    n += model.vocab_size * N_EMBD; // lm_head
+    n += n_embd * 2; // ln_f
+    n += model.vocab_size * n_embd; // lm_head
 
     n
 }
@@ -238,21 +250,23 @@ pub fn flatten_grads(grads: &GradAccum) -> Vec<f32> {
 
 /// Unflatten parameters back into the model.
 pub fn unflatten_params(model: &mut ModelWeights, params: &[f32]) {
+    let n_embd = model.config.n_embd();
     let mut idx = 0;
 
     for block in &mut model.blocks {
-        block.ln_1.weight.copy_from_slice(&params[idx..idx + N_EMBD]); idx += N_EMBD;
-        block.ln_1.bias.copy_from_slice(&params[idx..idx + N_EMBD]); idx += N_EMBD;
+        block.ln_1.weight.copy_from_slice(&params[idx..idx + n_embd]); idx += n_embd;
+        block.ln_1.bias.copy_from_slice(&params[idx..idx + n_embd]); idx += n_embd;
         for row in &mut block.attn.c_attn.w {
-            row.copy_from_slice(&params[idx..idx + N_EMBD]); idx += N_EMBD;
+            row.copy_from_slice(&params[idx..idx + n_embd]); idx += n_embd;
         }
-        block.attn.c_attn.b.copy_from_slice(&params[idx..idx + 3 * N_EMBD]); idx += 3 * N_EMBD;
+        let attn_b_len = block.attn.c_attn.b.len();
+        block.attn.c_attn.b.copy_from_slice(&params[idx..idx + attn_b_len]); idx += attn_b_len;
         for row in &mut block.attn.c_proj.w {
-            row.copy_from_slice(&params[idx..idx + N_EMBD]); idx += N_EMBD;
+            row.copy_from_slice(&params[idx..idx + n_embd]); idx += n_embd;
         }
-        block.attn.c_proj.b.copy_from_slice(&params[idx..idx + N_EMBD]); idx += N_EMBD;
-        block.ln_2.weight.copy_from_slice(&params[idx..idx + N_EMBD]); idx += N_EMBD;
-        block.ln_2.bias.copy_from_slice(&params[idx..idx + N_EMBD]); idx += N_EMBD;
+        block.attn.c_proj.b.copy_from_slice(&params[idx..idx + n_embd]); idx += n_embd;
+        block.ln_2.weight.copy_from_slice(&params[idx..idx + n_embd]); idx += n_embd;
+        block.ln_2.bias.copy_from_slice(&params[idx..idx + n_embd]); idx += n_embd;
 
         match &mut block.ffn {
             FfnWeights::PerBand(w) => {
@@ -264,35 +278,37 @@ pub fn unflatten_params(model: &mut ModelWeights, params: &[f32]) {
                     band.copy_from_slice(&params[idx..idx + 2]); idx += 2;
                 }
                 for row in &mut w.out_proj.w {
-                    row.copy_from_slice(&params[idx..idx + N_EMBD]); idx += N_EMBD;
+                    row.copy_from_slice(&params[idx..idx + n_embd]); idx += n_embd;
                 }
-                w.out_proj.b.copy_from_slice(&params[idx..idx + N_EMBD]); idx += N_EMBD;
+                w.out_proj.b.copy_from_slice(&params[idx..idx + n_embd]); idx += n_embd;
             }
             FfnWeights::KerrMaestro(w) => {
-                w.kerr.gamma_raw.copy_from_slice(&params[idx..idx + N_BANDS]); idx += N_BANDS;
-                w.kerr.omega.copy_from_slice(&params[idx..idx + N_BANDS]); idx += N_BANDS;
+                let n_bands = w.kerr.gamma_raw.len();
+                let maestro_dim = w.maestro.squeeze.b.len();
+                w.kerr.gamma_raw.copy_from_slice(&params[idx..idx + n_bands]); idx += n_bands;
+                w.kerr.omega.copy_from_slice(&params[idx..idx + n_bands]); idx += n_bands;
                 w.kerr.alpha = params[idx]; idx += 1;
                 w.kerr.beta = params[idx]; idx += 1;
                 for row in &mut w.maestro.squeeze.w {
-                    row.copy_from_slice(&params[idx..idx + N_EMBD]); idx += N_EMBD;
+                    row.copy_from_slice(&params[idx..idx + n_embd]); idx += n_embd;
                 }
-                w.maestro.squeeze.b.copy_from_slice(&params[idx..idx + MAESTRO_DIM]); idx += MAESTRO_DIM;
+                w.maestro.squeeze.b.copy_from_slice(&params[idx..idx + maestro_dim]); idx += maestro_dim;
                 for row in &mut w.maestro.process_1.w {
-                    row.copy_from_slice(&params[idx..idx + MAESTRO_DIM]); idx += MAESTRO_DIM;
+                    row.copy_from_slice(&params[idx..idx + maestro_dim]); idx += maestro_dim;
                 }
-                w.maestro.process_1.b.copy_from_slice(&params[idx..idx + N_EMBD]); idx += N_EMBD;
+                w.maestro.process_1.b.copy_from_slice(&params[idx..idx + n_embd]); idx += n_embd;
                 for row in &mut w.out_proj.w {
-                    row.copy_from_slice(&params[idx..idx + N_EMBD]); idx += N_EMBD;
+                    row.copy_from_slice(&params[idx..idx + n_embd]); idx += n_embd;
                 }
-                w.out_proj.b.copy_from_slice(&params[idx..idx + N_EMBD]); idx += N_EMBD;
+                w.out_proj.b.copy_from_slice(&params[idx..idx + n_embd]); idx += n_embd;
             }
         }
     }
 
-    model.ln_f.weight.copy_from_slice(&params[idx..idx + N_EMBD]); idx += N_EMBD;
-    model.ln_f.bias.copy_from_slice(&params[idx..idx + N_EMBD]); idx += N_EMBD;
+    model.ln_f.weight.copy_from_slice(&params[idx..idx + n_embd]); idx += n_embd;
+    model.ln_f.bias.copy_from_slice(&params[idx..idx + n_embd]); idx += n_embd;
     for row in &mut model.lm_head {
-        row.copy_from_slice(&params[idx..idx + N_EMBD]); idx += N_EMBD;
+        row.copy_from_slice(&params[idx..idx + n_embd]); idx += n_embd;
     }
 
     assert_eq!(idx, params.len(), "Param count mismatch in unflatten");

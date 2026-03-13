@@ -8,3 +8,4 @@ license = "Apache-2.0"
 wgpu = "24"
 bytemuck = { version = "1", features = ["derive"] }
 pollster = "0.4"
+mimalloc = "0.1"

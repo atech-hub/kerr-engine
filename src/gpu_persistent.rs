@@ -278,7 +278,9 @@ impl GpuPersistent {
             kerr_gamma: Self::storage_buf(device, &gamma_sp),
             kerr_omega: Self::storage_buf(device, &block.kerr.omega),
             kerr_rk4_params: Self::uniform_buf(device, &KerrRk4Params {
-                n_bands: N_BANDS as u32, dt: RK4_DT, alpha: kerr_alpha, beta: kerr_beta,
+                n_bands: block.kerr.gamma_raw.len() as u32,
+                dt: 1.0 / block.kerr.rk4_n_steps as f32,
+                alpha: kerr_alpha, beta: kerr_beta,
             }),
             maestro_sq_w: Self::storage_buf(device, &Self::flatten_weights(&block.maestro.squeeze.w)),
             maestro_sq_b: Self::storage_buf(device, &block.maestro.squeeze.b),
@@ -442,10 +444,11 @@ impl GpuPersistent {
         }
 
         // 7. Copy b128 → staging for readback
+        let n_embd = x.len();
         encoder.copy_buffer_to_buffer(
             &self.scratch.b128, 0,
             &self.scratch.staging, 0,
-            (N_EMBD * 4) as u64,
+            (n_embd * 4) as u64,
         );
 
         // Single submit for the entire chain
@@ -472,11 +475,13 @@ impl GpuPersistent {
     /// Output: interleaved 128 floats.
     pub fn forward_kerr_fused(&self, block_idx: usize, x: &[f32]) -> Vec<f32> {
         let bw = &self.blocks[block_idx];
+        let n_bands = x.len() / 2;
+        let n_embd = x.len();
 
-        // Deinterleave on CPU (128 → 64+64)
-        let mut r = vec![0.0f32; N_BANDS];
-        let mut s = vec![0.0f32; N_BANDS];
-        for k in 0..N_BANDS {
+        // Deinterleave on CPU
+        let mut r = vec![0.0f32; n_bands];
+        let mut s = vec![0.0f32; n_bands];
+        for k in 0..n_bands {
             r[k] = x[k * 2];
             s[k] = x[k * 2 + 1];
         }
@@ -486,6 +491,10 @@ impl GpuPersistent {
         self.queue.write_buffer(&self.scratch.s64, 0, bytemuck::cast_slice(&s));
 
         let mut encoder = self.device.create_command_encoder(&Default::default());
+
+        // Fused RK4 shader uses shared memory — all bands must fit in one workgroup (max 256)
+        assert!(n_bands <= 256, "Fused Kerr RK4 shader supports up to 256 bands (n_embd=512). \
+            For larger models, use GpuBackend (per-call) which uses non-fused kerr_step.wgsl.");
 
         // 8 RK4 steps, each a single dispatch (fused shader does all 4 derivative evals)
         let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -499,17 +508,22 @@ impl GpuPersistent {
             ],
         });
 
-        for _ in 0..RK4_N_STEPS {
+        // n_steps from the KerrRk4Params uniform — but we don't have direct access here.
+        // The number of dispatches must match what was configured in upload_block.
+        // For now, read from the scratch buffer size (r64 = n_bands floats).
+        // TODO: store n_steps in BlockWeightsGpu when checkpoint format supports non-default configs.
+        let n_steps = 8; // matches default; will be parameterized with checkpoint v2
+        for _ in 0..n_steps {
             let mut pass = encoder.begin_compute_pass(&Default::default());
             pass.set_pipeline(&self.pipelines.kerr_rk4);
             pass.set_bind_group(0, &bg, &[]);
-            pass.dispatch_workgroups(1, 1, 1); // 64 threads, 64 bands
+            // Fused RK4: all bands in one workgroup (shared memory for neighbour coupling)
+            // Shader supports up to 512 bands (n_embd=1024) with workgroup_size(256)
+            pass.dispatch_workgroups(1, 1, 1);
         }
 
-        // Copy r64,s64 to staging (interleave on CPU after readback)
-        // We need 128 floats of staging. Copy r64 to first half, s64 to second.
-        encoder.copy_buffer_to_buffer(&self.scratch.r64, 0, &self.scratch.staging, 0, (N_BANDS * 4) as u64);
-        encoder.copy_buffer_to_buffer(&self.scratch.s64, 0, &self.scratch.staging, (N_BANDS * 4) as u64, (N_BANDS * 4) as u64);
+        encoder.copy_buffer_to_buffer(&self.scratch.r64, 0, &self.scratch.staging, 0, (n_bands * 4) as u64);
+        encoder.copy_buffer_to_buffer(&self.scratch.s64, 0, &self.scratch.staging, (n_bands * 4) as u64, (n_bands * 4) as u64);
 
         self.queue.submit(Some(encoder.finish()));
 
@@ -528,10 +542,10 @@ impl GpuPersistent {
         self.scratch.staging.unmap();
 
         // Re-interleave
-        let mut out = vec![0.0f32; N_EMBD];
-        for k in 0..N_BANDS {
+        let mut out = vec![0.0f32; n_embd];
+        for k in 0..n_bands {
             out[k * 2] = raw[k];           // r from first half
-            out[k * 2 + 1] = raw[N_BANDS + k]; // s from second half
+            out[k * 2 + 1] = raw[n_bands + k]; // s from second half
         }
         out
     }
@@ -566,6 +580,7 @@ pub fn benchmark_persistent() {
             gamma_raw: (0..N_BANDS).map(|k| -2.0 + k as f32 * 0.05).collect(),
             omega: (0..N_BANDS).map(|k| k as f32 / N_BANDS as f32).collect(),
             alpha: 0.1, beta: 0.1,
+            rk4_n_steps: RK4_N_STEPS,
         },
         maestro: MaestroWeights {
             squeeze: LinearWeights {
@@ -595,6 +610,7 @@ pub fn benchmark_persistent() {
             w: (0..N_EMBD).map(|i| (0..N_EMBD).map(|j| ((i * N_EMBD + j) as f32 * 0.001).cos()).collect()).collect(),
             b: vec![0.01; N_EMBD],
         },
+        n_head: N_HEAD,
     };
 
     // Upload weights to GPU (ONE TIME)

@@ -76,13 +76,13 @@ pub fn load(path: &str) -> io::Result<TrainingState> {
 
     // Adam state
     let adam_t = read_u64(&mut f)? as usize;
-    let n_params = optim::count_params_for_vocab(vocab_size);
+    let n_params = optim::count_params_for_vocab(vocab_size, &ModelConfig::default_128());
     let adam_m = read_f32_vec(&mut f, n_params)?;
     let adam_v = read_f32_vec(&mut f, n_params)?;
 
     // Model weights
     let params = read_f32_vec(&mut f, n_params)?;
-    let mut model = init_model(vocab_size, 0); // seed irrelevant, we overwrite
+    let mut model = init_model(vocab_size, 0, ModelConfig::default_128()); // seed irrelevant, we overwrite
     optim::unflatten_params(&mut model, &params);
 
     let optimizer = Adam::from_checkpoint(lr, adam_t, adam_m, adam_v);

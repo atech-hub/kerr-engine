@@ -5,6 +5,9 @@
 //
 // Uses workgroup shared memory to synchronise between derivative stages
 // (neighbour coupling requires all bands' values at each sub-step).
+//
+// Supports up to 256 bands (n_embd up to 512). For larger models,
+// the host falls back to non-fused kerr_step.wgsl with separate dispatches.
 
 struct Params {
     n_bands: u32,
@@ -20,8 +23,8 @@ struct Params {
 @group(0) @binding(4) var<uniform> params: Params;
 
 // Shared memory for intermediate state (need all bands visible for neighbour coupling)
-var<workgroup> shared_r: array<f32, 64>;
-var<workgroup> shared_s: array<f32, 64>;
+var<workgroup> shared_r: array<f32, 256>;
+var<workgroup> shared_s: array<f32, 256>;
 
 // Compute derivative for one band given shared r,s state
 fn kerr_deriv_r(band: u32, n: u32, ri: f32, si: f32) -> f32 {
@@ -46,7 +49,7 @@ fn kerr_deriv_s(band: u32, n: u32, ri: f32, si: f32) -> f32 {
     return -gamma[band] * si + phi * ri;
 }
 
-@compute @workgroup_size(64)
+@compute @workgroup_size(256)
 fn kerr_rk4_step(@builtin(local_invocation_id) lid: vec3<u32>) {
     let band = lid.x;
     let n = params.n_bands;

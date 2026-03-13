@@ -19,6 +19,26 @@ pub struct GpuBackend {
     layer_norm_layout: wgpu::BindGroupLayout,
     kerr_deriv_pipeline: wgpu::ComputePipeline,
     kerr_deriv_layout: wgpu::BindGroupLayout,
+    // Backward shaders
+    matvec_bwd_pipeline: wgpu::ComputePipeline,
+    matvec_bwd_layout: wgpu::BindGroupLayout,
+    layer_norm_bwd_pipeline: wgpu::ComputePipeline,
+    layer_norm_bwd_layout: wgpu::BindGroupLayout,
+    #[allow(dead_code)] // Ready for FFN backward restructuring
+    gelu_bwd_pipeline: wgpu::ComputePipeline,
+    #[allow(dead_code)]
+    gelu_bwd_layout: wgpu::BindGroupLayout,
+    // Attention backward (two dispatches)
+    attn_bwd_scores_pipeline: wgpu::ComputePipeline,
+    attn_bwd_scores_layout: wgpu::BindGroupLayout,
+    attn_bwd_dkv_pipeline: wgpu::ComputePipeline,
+    attn_bwd_dkv_layout: wgpu::BindGroupLayout,
+    // Batched outer product: d_w = D_Y^T @ X
+    outer_product_pipeline: wgpu::ComputePipeline,
+    outer_product_layout: wgpu::BindGroupLayout,
+    // Batched matvec backward: d_x[pos] = W^T @ d_y[pos] for all positions
+    matvec_bwd_batch_pipeline: wgpu::ComputePipeline,
+    matvec_bwd_batch_layout: wgpu::BindGroupLayout,
 }
 
 // ─── Uniform param structs ──────────────────────────────────────
@@ -48,6 +68,51 @@ struct KerrDerivParams {
     _pad1: u32,
     _pad2: u32,
     _pad3: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct MatvecBwdParams {
+    out_dim: u32,
+    in_dim: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct GeluBwdParams {
+    len: u32,
+    _pad1: u32,
+    _pad2: u32,
+    _pad3: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct AttnBwdParams {
+    seq_len: u32,
+    n_head: u32,
+    head_dim: u32,
+    n_embd: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct OuterProductParams {
+    out_dim: u32,
+    in_dim: u32,
+    n_pos: u32,
+    compute_bias: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct MatvecBwdBatchParams {
+    out_dim: u32,
+    in_dim: u32,
+    n_pos: u32,
+    _pad: u32,
 }
 
 // ─── Helper: build bind group layout entries ────────────────────
@@ -101,6 +166,27 @@ impl GpuBackend {
         }))
         .expect("Failed to find GPU adapter");
 
+        Self::from_adapter(adapter)
+    }
+
+    /// Initialize GPU with a specific adapter selected by index.
+    pub fn with_device_index(idx: usize) -> Self {
+        let instance = wgpu::Instance::default();
+        let adapters: Vec<_> = instance.enumerate_adapters(wgpu::Backends::all()).into_iter().collect();
+        assert!(
+            idx < adapters.len(),
+            "GPU device index {idx} out of range ({} adapters available)",
+            adapters.len()
+        );
+        // enumerate_adapters returns owned adapters — take the one we want
+        let mut adapters = adapters;
+        let adapter = adapters.swap_remove(idx);
+
+        Self::from_adapter(adapter)
+    }
+
+    /// Shared constructor: compile shaders and build pipelines from a chosen adapter.
+    fn from_adapter(adapter: wgpu::Adapter) -> Self {
         println!("  GPU adapter: {}", adapter.get_info().name);
         println!("  Backend:     {:?}", adapter.get_info().backend);
 
@@ -219,6 +305,192 @@ impl GpuBackend {
             cache: None,
         });
 
+        // ─── Compile backward shaders ──────────────────────────────
+
+        // matvec_backward: d_x = W^T @ d_y
+        let mvb_src = include_str!("../shaders/matvec_backward.wgsl");
+        let mvb_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("matvec_backward"),
+            source: wgpu::ShaderSource::Wgsl(mvb_src.into()),
+        });
+        // bindings: 0=w(ro), 1=d_y(ro), 2=d_x(rw), 3=params(uniform)
+        let matvec_bwd_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("matvec_bwd_layout"),
+            entries: &[storage_ro(0), storage_ro(1), storage_rw(2), uniform_entry(3)],
+        });
+        let mvb_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("matvec_bwd_pl"),
+            bind_group_layouts: &[&matvec_bwd_layout],
+            push_constant_ranges: &[],
+        });
+        let matvec_bwd_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("matvec_bwd_pipeline"),
+            layout: Some(&mvb_pl),
+            module: &mvb_module,
+            entry_point: Some("matvec_backward"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        // layer_norm_backward: d_x, d_weight, d_bias from d_y
+        let lnb_src = include_str!("../shaders/layer_norm_backward.wgsl");
+        let lnb_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("layer_norm_backward"),
+            source: wgpu::ShaderSource::Wgsl(lnb_src.into()),
+        });
+        // bindings: 0=d_y(ro), 1=x(ro), 2=weight(ro), 3=out(rw), 4=params(uniform)
+        let layer_norm_bwd_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("layer_norm_bwd_layout"),
+            entries: &[storage_ro(0), storage_ro(1), storage_ro(2), storage_rw(3), uniform_entry(4)],
+        });
+        let lnb_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("layer_norm_bwd_pl"),
+            bind_group_layouts: &[&layer_norm_bwd_layout],
+            push_constant_ranges: &[],
+        });
+        let layer_norm_bwd_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("layer_norm_bwd_pipeline"),
+            layout: Some(&lnb_pl),
+            module: &lnb_module,
+            entry_point: Some("layer_norm_backward"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        // gelu_backward: d_x = d_y * gelu'(x)
+        let gb_src = include_str!("../shaders/gelu_backward.wgsl");
+        let gb_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("gelu_backward"),
+            source: wgpu::ShaderSource::Wgsl(gb_src.into()),
+        });
+        // bindings: 0=d_y(ro), 1=x(ro), 2=d_x(rw), 3=params(uniform)
+        let gelu_bwd_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("gelu_bwd_layout"),
+            entries: &[storage_ro(0), storage_ro(1), storage_rw(2), uniform_entry(3)],
+        });
+        let gb_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("gelu_bwd_pl"),
+            bind_group_layouts: &[&gelu_bwd_layout],
+            push_constant_ranges: &[],
+        });
+        let gelu_bwd_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("gelu_bwd_pipeline"),
+            layout: Some(&gb_pl),
+            module: &gb_module,
+            entry_point: Some("gelu_backward"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        // ─── Compile attention backward shaders ─────────────────────
+        // Dispatch 1: attn_backward_scores — one workgroup per (pos, head)
+        let abs_src = include_str!("../shaders/attn_backward_scores.wgsl");
+        let abs_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("attn_backward_scores"),
+            source: wgpu::ShaderSource::Wgsl(abs_src.into()),
+        });
+        // bindings: 0=d_out(ro), 1=q(ro), 2=k(ro), 3=v(ro), 4=att_weights(ro),
+        //           5=d_q(rw), 6=d_score_buf(rw), 7=params(uniform)
+        let attn_bwd_scores_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("attn_bwd_scores_layout"),
+            entries: &[
+                storage_ro(0), storage_ro(1), storage_ro(2), storage_ro(3), storage_ro(4),
+                storage_rw(5), storage_rw(6), uniform_entry(7),
+            ],
+        });
+        let abs_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("attn_bwd_scores_pl"),
+            bind_group_layouts: &[&attn_bwd_scores_layout],
+            push_constant_ranges: &[],
+        });
+        let attn_bwd_scores_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("attn_bwd_scores_pipeline"),
+            layout: Some(&abs_pl),
+            module: &abs_module,
+            entry_point: Some("attn_backward_scores"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        // Dispatch 2: attn_backward_dkv — one thread per (ki, d_global)
+        let abdkv_src = include_str!("../shaders/attn_backward_dkv.wgsl");
+        let abdkv_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("attn_backward_dkv"),
+            source: wgpu::ShaderSource::Wgsl(abdkv_src.into()),
+        });
+        // bindings: 0=q(ro), 1=d_out(ro), 2=att_weights(ro), 3=d_score_buf(ro),
+        //           4=d_k(rw), 5=d_v(rw), 6=params(uniform)
+        let attn_bwd_dkv_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("attn_bwd_dkv_layout"),
+            entries: &[
+                storage_ro(0), storage_ro(1), storage_ro(2), storage_ro(3),
+                storage_rw(4), storage_rw(5), uniform_entry(6),
+            ],
+        });
+        let abdkv_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("attn_bwd_dkv_pl"),
+            bind_group_layouts: &[&attn_bwd_dkv_layout],
+            push_constant_ranges: &[],
+        });
+        let attn_bwd_dkv_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("attn_bwd_dkv_pipeline"),
+            layout: Some(&abdkv_pl),
+            module: &abdkv_module,
+            entry_point: Some("attn_backward_dkv"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        // ─── Compile outer product shader ────────────────────────────
+        let op_src = include_str!("../shaders/outer_product.wgsl");
+        let op_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("outer_product"),
+            source: wgpu::ShaderSource::Wgsl(op_src.into()),
+        });
+        // bindings: 0=d_y(ro), 1=x(ro), 2=d_w(rw), 3=d_b(rw), 4=params(uniform)
+        let outer_product_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("outer_product_layout"),
+            entries: &[storage_ro(0), storage_ro(1), storage_rw(2), storage_rw(3), uniform_entry(4)],
+        });
+        let op_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("outer_product_pl"),
+            bind_group_layouts: &[&outer_product_layout],
+            push_constant_ranges: &[],
+        });
+        let outer_product_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("outer_product_pipeline"),
+            layout: Some(&op_pl),
+            module: &op_module,
+            entry_point: Some("outer_product"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        // ─── Compile batched matvec backward shader ─────────────────
+        let mvbb_src = include_str!("../shaders/matvec_backward_batch.wgsl");
+        let mvbb_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("matvec_backward_batch"),
+            source: wgpu::ShaderSource::Wgsl(mvbb_src.into()),
+        });
+        // bindings: 0=w(ro), 1=d_y(ro), 2=d_x(rw), 3=params(uniform)
+        let matvec_bwd_batch_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("matvec_bwd_batch_layout"),
+            entries: &[storage_ro(0), storage_ro(1), storage_rw(2), uniform_entry(3)],
+        });
+        let mvbb_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("matvec_bwd_batch_pl"),
+            bind_group_layouts: &[&matvec_bwd_batch_layout],
+            push_constant_ranges: &[],
+        });
+        let matvec_bwd_batch_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("matvec_bwd_batch_pipeline"),
+            layout: Some(&mvbb_pl),
+            module: &mvbb_module,
+            entry_point: Some("matvec_backward_batch"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
         Self {
             device,
             queue,
@@ -228,6 +500,20 @@ impl GpuBackend {
             layer_norm_layout,
             kerr_deriv_pipeline,
             kerr_deriv_layout,
+            matvec_bwd_pipeline,
+            matvec_bwd_layout,
+            layer_norm_bwd_pipeline,
+            layer_norm_bwd_layout,
+            gelu_bwd_pipeline,
+            gelu_bwd_layout,
+            attn_bwd_scores_pipeline,
+            attn_bwd_scores_layout,
+            attn_bwd_dkv_pipeline,
+            attn_bwd_dkv_layout,
+            outer_product_pipeline,
+            outer_product_layout,
+            matvec_bwd_batch_pipeline,
+            matvec_bwd_batch_layout,
         }
     }
 
@@ -418,52 +704,50 @@ impl GpuBackend {
 
     /// Kerr-ODE forward via host-side RK4 with GPU derivative evaluations.
     fn gpu_kerr_ode(&self, weights: &KerrWeights, x: &[f32]) -> Vec<f32> {
+        let n_bands = weights.gamma_raw.len();
+        let n_embd = n_bands * 2;
+        let n_steps = weights.rk4_n_steps;
+        let dt = 1.0 / n_steps as f32;
+
         // Unpack interleaved [r0, s0, r1, s1, ...] into separate r, s arrays
-        let mut r = vec![0.0f32; N_BANDS];
-        let mut s = vec![0.0f32; N_BANDS];
-        for k in 0..N_BANDS {
+        let mut r = vec![0.0f32; n_bands];
+        let mut s = vec![0.0f32; n_bands];
+        for k in 0..n_bands {
             r[k] = x[k * 2];
             s[k] = x[k * 2 + 1];
         }
 
-        // Pre-compute softplus(gamma_raw) on CPU (64 values, trivial)
+        // Pre-compute softplus(gamma_raw) on CPU (trivial)
         fn softplus(x: f32) -> f32 {
             if x > 20.0 { x } else { (1.0 + x.exp()).ln() }
         }
         let gamma: Vec<f32> = weights.gamma_raw.iter().map(|&g| softplus(g)).collect();
 
-        // RK4 integration: 8 steps, each step needs 4 derivative evaluations
-        for _ in 0..RK4_N_STEPS {
-            let dt = RK4_DT;
-
-            // k1 = f(r, s)
+        // RK4 integration
+        for _ in 0..n_steps {
             let (k1r, k1s) = self.gpu_kerr_derivative(&r, &s, &gamma, &weights.omega, weights.alpha, weights.beta);
 
-            // k2 = f(r + dt/2 * k1r, s + dt/2 * k1s)
             let r2: Vec<f32> = r.iter().zip(&k1r).map(|(&ri, &k)| ri + 0.5 * dt * k).collect();
             let s2: Vec<f32> = s.iter().zip(&k1s).map(|(&si, &k)| si + 0.5 * dt * k).collect();
             let (k2r, k2s) = self.gpu_kerr_derivative(&r2, &s2, &gamma, &weights.omega, weights.alpha, weights.beta);
 
-            // k3 = f(r + dt/2 * k2r, s + dt/2 * k2s)
             let r3: Vec<f32> = r.iter().zip(&k2r).map(|(&ri, &k)| ri + 0.5 * dt * k).collect();
             let s3: Vec<f32> = s.iter().zip(&k2s).map(|(&si, &k)| si + 0.5 * dt * k).collect();
             let (k3r, k3s) = self.gpu_kerr_derivative(&r3, &s3, &gamma, &weights.omega, weights.alpha, weights.beta);
 
-            // k4 = f(r + dt * k3r, s + dt * k3s)
             let r4: Vec<f32> = r.iter().zip(&k3r).map(|(&ri, &k)| ri + dt * k).collect();
             let s4: Vec<f32> = s.iter().zip(&k3s).map(|(&si, &k)| si + dt * k).collect();
             let (k4r, k4s) = self.gpu_kerr_derivative(&r4, &s4, &gamma, &weights.omega, weights.alpha, weights.beta);
 
-            // Combine: r_new = r + dt/6 * (k1 + 2*k2 + 2*k3 + k4)
-            for k in 0..N_BANDS {
+            for k in 0..n_bands {
                 r[k] += dt / 6.0 * (k1r[k] + 2.0 * k2r[k] + 2.0 * k3r[k] + k4r[k]);
                 s[k] += dt / 6.0 * (k1s[k] + 2.0 * k2s[k] + 2.0 * k3s[k] + k4s[k]);
             }
         }
 
         // Re-interleave
-        let mut out = vec![0.0f32; N_EMBD];
-        for k in 0..N_BANDS {
+        let mut out = vec![0.0f32; n_embd];
+        for k in 0..n_bands {
             out[k * 2] = r[k];
             out[k * 2 + 1] = s[k];
         }
@@ -512,33 +796,33 @@ impl ComputeBackend for GpuBackend {
     }
 
     fn attention(&self, weights: &AttentionWeights, x: &[Vec<f32>]) -> Vec<Vec<f32>> {
-        // Attention: GPU-accelerated projections, CPU softmax
         let t = x.len();
-        let scale = 1.0 / (HEAD_DIM as f32).sqrt();
+        let n_embd = x[0].len();
+        let n_head = weights.n_head;
+        let head_dim = n_embd / n_head;
+        let scale = 1.0 / (head_dim as f32).sqrt();
 
-        let mut q_all = vec![vec![0.0f32; N_EMBD]; t];
-        let mut k_all = vec![vec![0.0f32; N_EMBD]; t];
-        let mut v_all = vec![vec![0.0f32; N_EMBD]; t];
+        let mut q_all = vec![vec![0.0f32; n_embd]; t];
+        let mut k_all = vec![vec![0.0f32; n_embd]; t];
+        let mut v_all = vec![vec![0.0f32; n_embd]; t];
 
         for pos in 0..t {
-            // QKV projection on GPU
             let qkv = self.linear(&weights.c_attn.w, &weights.c_attn.b, &x[pos]);
-            for i in 0..N_EMBD {
+            for i in 0..n_embd {
                 q_all[pos][i] = qkv[i];
-                k_all[pos][i] = qkv[N_EMBD + i];
-                v_all[pos][i] = qkv[2 * N_EMBD + i];
+                k_all[pos][i] = qkv[n_embd + i];
+                v_all[pos][i] = qkv[2 * n_embd + i];
             }
         }
 
-        // Attention scores + softmax on CPU (small T, dominated by projection cost)
-        let mut out = vec![vec![0.0f32; N_EMBD]; t];
-        for head in 0..N_HEAD {
-            let offset = head * HEAD_DIM;
+        let mut out = vec![vec![0.0f32; n_embd]; t];
+        for head in 0..n_head {
+            let offset = head * head_dim;
             for qi in 0..t {
                 let mut att = vec![f32::NEG_INFINITY; t];
                 for ki in 0..=qi {
                     let mut dot = 0.0f32;
-                    for d in 0..HEAD_DIM {
+                    for d in 0..head_dim {
                         dot += q_all[qi][offset + d] * k_all[ki][offset + d];
                     }
                     att[ki] = dot * scale;
@@ -554,7 +838,7 @@ impl ComputeBackend for GpuBackend {
                     att[ki] /= exp_sum;
                 }
 
-                for d in 0..HEAD_DIM {
+                for d in 0..head_dim {
                     let mut sum = 0.0f32;
                     for ki in 0..=qi {
                         sum += att[ki] * v_all[ki][offset + d];
@@ -564,20 +848,20 @@ impl ComputeBackend for GpuBackend {
             }
         }
 
-        // Output projection on GPU
         out.iter()
             .map(|o| self.linear(&weights.c_proj.w, &weights.c_proj.b, o))
             .collect()
     }
 
     fn per_band_linear(&self, weights: &PerBandLinearWeights, x: &[Vec<f32>]) -> Vec<Vec<f32>> {
-        // Per-band 2x2 is tiny — CPU is fine, output projection goes to GPU
         let t = x.len();
+        let n_bands = weights.band_w.len();
+        let n_embd = n_bands * 2;
         let mut result = Vec::with_capacity(t);
 
         for pos in 0..t {
-            let mut bands_out = vec![0.0f32; N_EMBD];
-            for band in 0..N_BANDS {
+            let mut bands_out = vec![0.0f32; n_embd];
+            for band in 0..n_bands {
                 let r_in = x[pos][band * 2];
                 let s_in = x[pos][band * 2 + 1];
                 let w = &weights.band_w[band];
@@ -595,13 +879,14 @@ impl ComputeBackend for GpuBackend {
 
     fn kerr_maestro_add(&self, weights: &KerrMaestroAddWeights, x: &[Vec<f32>]) -> Vec<Vec<f32>> {
         let t = x.len();
+        let n_embd = x[0].len();
         let mut result = Vec::with_capacity(t);
 
         for pos in 0..t {
             let kerr_out = self.kerr_ode(&weights.kerr, &x[pos]);
             let maestro_out = self.maestro(&weights.maestro, &x[pos]);
-            let mut combined = vec![0.0f32; N_EMBD];
-            for i in 0..N_EMBD {
+            let mut combined = vec![0.0f32; n_embd];
+            for i in 0..n_embd {
                 combined[i] = kerr_out[i] + maestro_out[i];
             }
             let projected = self.linear(&weights.out_proj.w, &weights.out_proj.b, &combined);
@@ -609,6 +894,332 @@ impl ComputeBackend for GpuBackend {
         }
 
         result
+    }
+
+    fn linear_backward_dx(&self, d_y: &[f32], w: &[Vec<f32>]) -> Vec<f32> {
+        let out_dim = w.len();
+        let in_dim = if out_dim > 0 { w[0].len() } else { return vec![] };
+        let mut w_flat = Vec::with_capacity(out_dim * in_dim);
+        for row in w { w_flat.extend_from_slice(row); }
+
+        let w_buf = self.storage_buf("bwd_w", &w_flat);
+        let dy_buf = self.storage_buf("bwd_dy", d_y);
+        let dx_buf = self.output_buf("bwd_dx", in_dim);
+        let params = MatvecBwdParams {
+            out_dim: out_dim as u32, in_dim: in_dim as u32, _pad1: 0, _pad2: 0,
+        };
+        let params_buf = self.uniform_buf("bwd_params", &params);
+
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("matvec_bwd_bg"),
+            layout: &self.matvec_bwd_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: w_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: dy_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: dx_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: params_buf.as_entire_binding() },
+            ],
+        });
+
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&self.matvec_bwd_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            let workgroups = (in_dim as u32 + 63) / 64;
+            pass.dispatch_workgroups(workgroups, 1, 1);
+        }
+        self.queue.submit(Some(encoder.finish()));
+
+        self.readback(&dx_buf, in_dim)
+    }
+
+    fn layer_norm_backward(&self, d_y: &[f32], x: &[f32], weight: &[f32]) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        let dim = x.len();
+        let dy_buf = self.storage_buf("lnb_dy", d_y);
+        let x_buf = self.storage_buf("lnb_x", x);
+        let w_buf = self.storage_buf("lnb_w", weight);
+        let out_buf = self.output_buf("lnb_out", dim * 3); // d_x, d_weight, d_bias concatenated
+        let params = LayerNormParams { dim: dim as u32, _pad1: 0, _pad2: 0, _pad3: 0 };
+        let params_buf = self.uniform_buf("lnb_params", &params);
+
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("layer_norm_bwd_bg"),
+            layout: &self.layer_norm_bwd_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: dy_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: x_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: w_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: out_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: params_buf.as_entire_binding() },
+            ],
+        });
+
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&self.layer_norm_bwd_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(1, 1, 1); // single workgroup handles all
+        }
+        self.queue.submit(Some(encoder.finish()));
+
+        let result = self.readback(&out_buf, dim * 3);
+        let d_x = result[..dim].to_vec();
+        let d_weight = result[dim..dim * 2].to_vec();
+        let d_bias = result[dim * 2..].to_vec();
+        (d_x, d_weight, d_bias)
+    }
+
+    fn gelu_backward(&self, d_y: &[f32], x: &[f32]) -> Vec<f32> {
+        let n = x.len();
+        let dy_buf = self.storage_buf("gb_dy", d_y);
+        let x_buf = self.storage_buf("gb_x", x);
+        let dx_buf = self.output_buf("gb_dx", n);
+        let params = GeluBwdParams { len: n as u32, _pad1: 0, _pad2: 0, _pad3: 0 };
+        let params_buf = self.uniform_buf("gb_params", &params);
+
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("gelu_bwd_bg"),
+            layout: &self.gelu_bwd_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: dy_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: x_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: dx_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: params_buf.as_entire_binding() },
+            ],
+        });
+
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&self.gelu_bwd_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            let workgroups = (n as u32 + 63) / 64;
+            pass.dispatch_workgroups(workgroups, 1, 1);
+        }
+        self.queue.submit(Some(encoder.finish()));
+
+        self.readback(&dx_buf, n)
+    }
+
+    fn linear_backward_dx_batch(&self, d_y: &[Vec<f32>], w: &[Vec<f32>]) -> Vec<Vec<f32>> {
+        let n_pos = d_y.len();
+        let out_dim = w.len();
+        let in_dim = if out_dim > 0 { w[0].len() } else { return vec![vec![]; n_pos] };
+
+        // Flatten W and d_y
+        let mut w_flat = Vec::with_capacity(out_dim * in_dim);
+        for row in w { w_flat.extend_from_slice(row); }
+        let dy_flat: Vec<f32> = d_y.iter().flat_map(|v| v.iter().copied()).collect();
+
+        let w_buf = self.storage_buf("mvbb_w", &w_flat);
+        let dy_buf = self.storage_buf("mvbb_dy", &dy_flat);
+        let dx_buf = self.output_buf("mvbb_dx", n_pos * in_dim);
+        let params = MatvecBwdBatchParams {
+            out_dim: out_dim as u32, in_dim: in_dim as u32,
+            n_pos: n_pos as u32, _pad: 0,
+        };
+        let params_buf = self.uniform_buf("mvbb_params", &params);
+
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("mvbb_bg"),
+            layout: &self.matvec_bwd_batch_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: w_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: dy_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: dx_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: params_buf.as_entire_binding() },
+            ],
+        });
+
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&self.matvec_bwd_batch_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            let total = (n_pos * in_dim) as u32;
+            pass.dispatch_workgroups((total + 63) / 64, 1, 1);
+        }
+        self.queue.submit(Some(encoder.finish()));
+
+        let dx_flat = self.readback(&dx_buf, n_pos * in_dim);
+        dx_flat.chunks(in_dim).map(|c| c.to_vec()).collect()
+    }
+
+    fn outer_product_accum(
+        &self,
+        d_y: &[Vec<f32>],
+        x: &[Vec<f32>],
+        compute_bias: bool,
+    ) -> (Vec<Vec<f32>>, Vec<f32>) {
+        let n_pos = d_y.len();
+        let out_dim = d_y[0].len();
+        let in_dim = x[0].len();
+
+        // Flatten inputs: d_y[pos][i] → d_y_flat[pos * out_dim + i]
+        let d_y_flat: Vec<f32> = d_y.iter().flat_map(|v| v.iter().copied()).collect();
+        let x_flat: Vec<f32> = x.iter().flat_map(|v| v.iter().copied()).collect();
+
+        let dy_buf = self.storage_buf("op_dy", &d_y_flat);
+        let x_buf = self.storage_buf("op_x", &x_flat);
+        let dw_buf = self.output_buf("op_dw", out_dim * in_dim);
+        // d_b buffer — always create it (even if not used) for binding
+        let db_buf = self.output_buf("op_db", out_dim);
+        let params = OuterProductParams {
+            out_dim: out_dim as u32,
+            in_dim: in_dim as u32,
+            n_pos: n_pos as u32,
+            compute_bias: if compute_bias { 1 } else { 0 },
+        };
+        let params_buf = self.uniform_buf("op_params", &params);
+
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("outer_product_bg"),
+            layout: &self.outer_product_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: dy_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: x_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: dw_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: db_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: params_buf.as_entire_binding() },
+            ],
+        });
+
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&self.outer_product_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            // One workgroup per output row
+            pass.dispatch_workgroups(out_dim as u32, 1, 1);
+        }
+        self.queue.submit(Some(encoder.finish()));
+
+        // Readback and unflatten
+        let dw_flat = self.readback(&dw_buf, out_dim * in_dim);
+        let d_w: Vec<Vec<f32>> = dw_flat.chunks(in_dim).map(|c| c.to_vec()).collect();
+        let d_b = if compute_bias {
+            self.readback(&db_buf, out_dim)
+        } else {
+            vec![0.0f32; out_dim]
+        };
+
+        (d_w, d_b)
+    }
+
+    fn attention_backward(
+        &self,
+        d_pre_proj: &[Vec<f32>],
+        q_all: &[Vec<f32>],
+        k_all: &[Vec<f32>],
+        v_all: &[Vec<f32>],
+        att_weights: &[Vec<Vec<f32>>],
+        n_head: usize,
+    ) -> (Vec<Vec<f32>>, Vec<Vec<f32>>, Vec<Vec<f32>>) {
+        let t = d_pre_proj.len();
+        let n_embd = d_pre_proj[0].len();
+        let head_dim = n_embd / n_head;
+
+        // Flatten inputs to contiguous f32 arrays
+        let d_out_flat: Vec<f32> = d_pre_proj.iter().flat_map(|v| v.iter().copied()).collect();
+        let q_flat: Vec<f32> = q_all.iter().flat_map(|v| v.iter().copied()).collect();
+        let k_flat: Vec<f32> = k_all.iter().flat_map(|v| v.iter().copied()).collect();
+        let v_flat: Vec<f32> = v_all.iter().flat_map(|v| v.iter().copied()).collect();
+
+        // att_weights: [n_head][T][T] → flatten
+        // att_weights[head][pos][ki] → att_flat[head * T * T + pos * T + ki]
+        let mut att_flat = vec![0.0f32; n_head * t * t];
+        for (head, head_weights) in att_weights.iter().enumerate() {
+            for (pos, pos_weights) in head_weights.iter().enumerate() {
+                for (ki, &w) in pos_weights.iter().enumerate() {
+                    att_flat[head * t * t + pos * t + ki] = w;
+                }
+            }
+        }
+
+        // Create GPU buffers
+        let d_out_buf = self.storage_buf("ab_d_out", &d_out_flat);
+        let q_buf = self.storage_buf("ab_q", &q_flat);
+        let k_buf = self.storage_buf("ab_k", &k_flat);
+        let v_buf = self.storage_buf("ab_v", &v_flat);
+        let att_buf = self.storage_buf("ab_att", &att_flat);
+        let dq_buf = self.output_buf("ab_dq", t * n_embd);
+        let dk_buf = self.output_buf("ab_dk", t * n_embd);
+        let dv_buf = self.output_buf("ab_dv", t * n_embd);
+        let dscore_buf = self.output_buf("ab_dscore", t * n_head * t);
+
+        let params = AttnBwdParams {
+            seq_len: t as u32,
+            n_head: n_head as u32,
+            head_dim: head_dim as u32,
+            n_embd: n_embd as u32,
+        };
+        let params_buf = self.uniform_buf("ab_params", &params);
+        // Dispatch 2 needs its own uniform buffer (same data, different bind group)
+        let params_buf2 = self.uniform_buf("ab_params2", &params);
+
+        // ─── Dispatch 1: attn_backward_scores ──────────────────────
+        // One workgroup per (pos, head)
+        let bg1 = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("attn_bwd_scores_bg"),
+            layout: &self.attn_bwd_scores_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: d_out_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: q_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: k_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: v_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: att_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: dq_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: dscore_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 7, resource: params_buf.as_entire_binding() },
+            ],
+        });
+
+        // ─── Dispatch 2: attn_backward_dkv ─────────────────────────
+        // One thread per (ki, d_global)
+        let bg2 = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("attn_bwd_dkv_bg"),
+            layout: &self.attn_bwd_dkv_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: q_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: d_out_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: att_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: dscore_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: dk_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: dv_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: params_buf2.as_entire_binding() },
+            ],
+        });
+
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            // Dispatch 1: (T, n_head, 1) workgroups of 64 threads each
+            pass.set_pipeline(&self.attn_bwd_scores_pipeline);
+            pass.set_bind_group(0, &bg1, &[]);
+            pass.dispatch_workgroups(t as u32, n_head as u32, 1);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            // Dispatch 2: ceil(T * n_embd / 64) workgroups of 64 threads
+            pass.set_pipeline(&self.attn_bwd_dkv_pipeline);
+            pass.set_bind_group(0, &bg2, &[]);
+            let total_threads = (t * n_embd) as u32;
+            pass.dispatch_workgroups((total_threads + 63) / 64, 1, 1);
+        }
+        self.queue.submit(Some(encoder.finish()));
+
+        // Readback d_q, d_k, d_v and unflatten
+        let dq_flat = self.readback(&dq_buf, t * n_embd);
+        let dk_flat = self.readback(&dk_buf, t * n_embd);
+        let dv_flat = self.readback(&dv_buf, t * n_embd);
+
+        let unflatten = |flat: Vec<f32>| -> Vec<Vec<f32>> {
+            flat.chunks(n_embd).map(|c| c.to_vec()).collect()
+        };
+
+        (unflatten(dq_flat), unflatten(dk_flat), unflatten(dv_flat))
     }
 }
 
@@ -706,6 +1317,7 @@ pub fn validate_gpu_backend() {
             omega: (0..N_BANDS).map(|k| k as f32 / N_BANDS as f32).collect(),
             alpha: 0.1,
             beta: 0.1,
+            rk4_n_steps: RK4_N_STEPS,
         };
 
         let cpu_y = cpu.kerr_ode(&weights, &x);
@@ -767,6 +1379,7 @@ pub fn benchmark_gpu_vs_cpu() {
         omega: (0..N_BANDS).map(|k| k as f32 / N_BANDS as f32).collect(),
         alpha: 0.1,
         beta: 0.1,
+        rk4_n_steps: RK4_N_STEPS,
     };
 
     // Maestro

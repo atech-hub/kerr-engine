@@ -5,6 +5,7 @@
 //! Checkpoint save/load in checkpoint.rs.
 
 use crate::model::*;
+use crate::backend;
 use crate::checkpoint;
 use crate::data::Dataset;
 use crate::init::init_model;
@@ -25,17 +26,17 @@ pub struct CurriculumSchedule {
 
 impl CurriculumSchedule {
     /// Default 3-stage schedule matching Phase C Python.
-    pub fn default_3stage() -> Self {
+    pub fn default_3stage(n_bands: usize) -> Self {
         Self {
-            stages: vec![(8, 0.333), (24, 0.333), (N_BANDS, 0.334)],
+            stages: vec![(8.min(n_bands), 0.333), (24.min(n_bands), 0.333), (n_bands, 0.334)],
         }
     }
 
     /// No curriculum — all bands from the start.
     #[allow(dead_code)]
-    pub fn none() -> Self {
+    pub fn none(n_bands: usize) -> Self {
         Self {
-            stages: vec![(N_BANDS, 1.0)],
+            stages: vec![(n_bands, 1.0)],
         }
     }
 
@@ -78,6 +79,13 @@ pub struct TrainConfig {
     pub word_level: bool,
     pub resume_path: Option<String>,
     pub checkpoint_every: usize,
+    pub model_seed: u64,
+    pub train_seed: u64,
+    pub threads: Option<usize>,  // None = auto-detect
+    pub force_cpu: bool,
+    pub force_gpu: bool,
+    pub gpu_device: Option<usize>,
+    pub model_config: ModelConfig,
 }
 
 // ─── Training loop ────────────────────────────────────────────
@@ -96,32 +104,67 @@ pub fn train_with_config(config: TrainConfig) {
     // Init or resume
     let (mut model, mut optimizer, mut rng, start_iter) = if let Some(ref path) = config.resume_path {
         println!("Resuming from checkpoint: {path}");
-        let state = checkpoint::load(path).expect("Failed to load checkpoint");
+        let mut state = checkpoint::load(path).expect("Failed to load checkpoint");
         println!("  Resumed at iteration {}", state.iter);
+
+        // Handle vocab size mismatch (cross-corpus sequential training)
+        if dataset.vocab_size > state.model.vocab_size {
+            let old_vs = state.model.vocab_size;
+            let new_vs = dataset.vocab_size;
+            let extra_tokens = new_vs - old_vs;
+            println!("  Resizing vocab: {} → {} (+{} tokens)", old_vs, new_vs, extra_tokens);
+
+            // Extend lm_head with random init for new tokens
+            let n_embd = state.model.config.n_embd();
+            let limit = 1.0 / (n_embd as f32).sqrt();
+            let mut resize_rng = crate::rng::Rng::new(state.iter as u64 + 777);
+            for _ in 0..extra_tokens {
+                state.model.lm_head.push(
+                    (0..n_embd).map(|_| resize_rng.uniform(limit)).collect()
+                );
+            }
+
+            // Rebuild harmonic table for new vocab size
+            state.model.wte_phase = crate::model::build_harmonic_table_sized(new_vs, n_embd);
+            state.model.vocab_size = new_vs;
+
+            // Extend Adam m/v for the extra lm_head params
+            state.optimizer.extend(extra_tokens * n_embd);
+        } else if dataset.vocab_size < state.model.vocab_size {
+            println!("  Note: dataset vocab ({}) < checkpoint vocab ({}), keeping larger model",
+                     dataset.vocab_size, state.model.vocab_size);
+        }
+
         let rng = state.rng;
         (state.model, state.optimizer, rng, state.iter)
     } else {
-        println!("Initializing model...");
-        let model = init_model(dataset.vocab_size, 42);
+        println!("Initializing model (seed={})...", config.model_seed);
+        let model = init_model(dataset.vocab_size, config.model_seed, config.model_config);
         let n_params = optim::count_params(&model);
         println!("  Trainable parameters: {}", n_params);
         let optimizer = Adam::new(config.lr, n_params);
-        let rng = Rng::new(1337);
+        let rng = Rng::new(config.train_seed);
         (model, optimizer, rng, 0)
     };
 
-    // Detect thread count
-    let n_threads = thread::available_parallelism()
-        .map(|n| n.get().min(config.batch_size))
-        .unwrap_or(1);
+    // Select compute backend (CPU at 128-dim, GPU at larger scales)
+    let compute_backend = backend::auto_select(config.model_config.n_embd(), config.force_cpu, config.force_gpu, config.gpu_device);
+
+    // Thread count: explicit or auto-detect (capped at batch_size)
+    let n_threads = config.threads.unwrap_or_else(|| {
+        thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+    }).min(config.batch_size);
 
     let n_params = optim::count_params(&model);
 
     // Curriculum schedule
+    let n_bands = config.model_config.n_bands;
     let curriculum = if config.use_curriculum {
-        CurriculumSchedule::default_3stage()
+        CurriculumSchedule::default_3stage(n_bands)
     } else {
-        CurriculumSchedule::none()
+        CurriculumSchedule::none(n_bands)
     };
     print!("  Curriculum: ");
     curriculum.describe(config.n_iters);
@@ -154,11 +197,12 @@ pub fn train_with_config(config: TrainConfig) {
         let batch_results: Vec<(f32, Vec<f32>)> = thread::scope(|s| {
             let handles: Vec<_> = (0..config.batch_size).map(|b| {
                 let model_ref = &model;
+                let backend_ref = &*compute_backend;
                 let input_ref = &inputs[b];
                 let target_ref = &targets[b];
                 s.spawn(move || {
-                    let cache = model_ref.forward_with_cache_curriculum(input_ref, active_bands);
-                    let (loss, grads) = model_ref.backward(&cache, target_ref);
+                    let cache = model_ref.forward_with_cache_curriculum(input_ref, active_bands, backend_ref);
+                    let (loss, grads) = model_ref.backward(&cache, target_ref, backend_ref);
                     let flat_grads = optim::flatten_grads(&grads);
                     (loss, flat_grads)
                 })
@@ -197,10 +241,10 @@ pub fn train_with_config(config: TrainConfig) {
 
         // Eval: validation loss + sample text
         if iter > 0 && iter % eval_every == 0 {
-            let val_loss = eval_val_loss(&model, &dataset, config.batch_size, config.seq_len, active_bands, 8);
+            let val_loss = eval_val_loss(&model, &dataset, config.batch_size, config.seq_len, active_bands, 8, &*compute_backend);
             println!("  [val_loss={val_loss:.4}]");
             val_history.push((iter, val_loss));
-            let sample = generate(&model, &dataset, 200, &mut rng);
+            let sample = generate(&model, &dataset, 200, &mut rng, &*compute_backend);
             println!("\n--- Sample (iter {iter}, {active_bands} bands) ---");
             println!("{sample}");
             println!("---\n");
@@ -221,7 +265,7 @@ pub fn train_with_config(config: TrainConfig) {
 
     // Final val loss
     let final_active = curriculum.active_bands(config.n_iters.saturating_sub(1), config.n_iters);
-    let final_val = eval_val_loss(&model, &dataset, config.batch_size, config.seq_len, final_active, 8);
+    let final_val = eval_val_loss(&model, &dataset, config.batch_size, config.seq_len, final_active, 8, &*compute_backend);
     println!("  Final val_loss: {final_val:.4}");
     val_history.push((config.n_iters, final_val));
 
@@ -236,7 +280,7 @@ pub fn train_with_config(config: TrainConfig) {
     }
 
     // Final generation
-    let sample = generate(&model, &dataset, 500, &mut rng);
+    let sample = generate(&model, &dataset, 500, &mut rng, &*compute_backend);
     println!("\n=== Final sample ===");
     println!("{sample}");
     println!("===");
@@ -271,6 +315,8 @@ fn write_summary(
     let _ = writeln!(f, "  \"batch_size\": {},", config.batch_size);
     let _ = writeln!(f, "  \"seq_len\": {},", config.seq_len);
     let _ = writeln!(f, "  \"lr\": {},", config.lr);
+    let _ = writeln!(f, "  \"model_seed\": {},", config.model_seed);
+    let _ = writeln!(f, "  \"train_seed\": {},", config.train_seed);
     let _ = writeln!(f, "  \"curriculum\": {},", config.use_curriculum);
     let _ = writeln!(f, "  \"total_seconds\": {total_secs:.1},");
     let _ = writeln!(f, "  \"final_train_loss\": {final_train:.4},");
@@ -298,7 +344,7 @@ fn write_summary(
 
 /// Evaluate validation loss over multiple batches.
 /// Uses a fixed RNG seed so val loss is comparable across evals.
-fn eval_val_loss(model: &ModelWeights, dataset: &Dataset, batch_size: usize, seq_len: usize, active_bands: usize, n_batches: usize) -> f32 {
+fn eval_val_loss(model: &ModelWeights, dataset: &Dataset, batch_size: usize, seq_len: usize, active_bands: usize, n_batches: usize, backend: &dyn backend::ComputeBackend) -> f32 {
     let mut val_rng = Rng::new(9999); // fixed seed, independent of training RNG
     let mut total_loss = 0.0f32;
     let mut n_samples = 0usize;
@@ -306,7 +352,7 @@ fn eval_val_loss(model: &ModelWeights, dataset: &Dataset, batch_size: usize, seq
     for _ in 0..n_batches {
         let (inputs, targets) = dataset.sample_val_batch(&mut val_rng, batch_size, seq_len);
         for b in 0..batch_size {
-            let cache = model.forward_with_cache_curriculum(&inputs[b], active_bands);
+            let cache = model.forward_with_cache_curriculum(&inputs[b], active_bands, backend);
             // Compute loss only (no gradients needed)
             let t = cache.logits.len();
             let mut batch_loss = 0.0f32;
@@ -327,16 +373,17 @@ fn eval_val_loss(model: &ModelWeights, dataset: &Dataset, batch_size: usize, seq
 }
 
 /// Generate text by sampling from the model.
-fn generate(model: &ModelWeights, dataset: &Dataset, n_tokens: usize, rng: &mut Rng) -> String {
+fn generate(model: &ModelWeights, dataset: &Dataset, n_tokens: usize, rng: &mut Rng, backend: &dyn crate::backend::ComputeBackend) -> String {
     let start_idx = *dataset.token_to_idx.get("\n").unwrap_or(&0);
     let mut tokens = vec![start_idx];
 
     for _ in 0..n_tokens {
-        let start = if tokens.len() > BLOCK_SIZE { tokens.len() - BLOCK_SIZE } else { 0 };
+        let block_size = model.config.block_size;
+        let start = if tokens.len() > block_size { tokens.len() - block_size } else { 0 };
         let context = &tokens[start..];
 
-        let logits_all = model.forward(context);
-        let logits = logits_all.last().unwrap();
+        let cache = model.forward_with_cache(context, backend);
+        let logits = cache.logits.last().unwrap();
 
         let temp = 0.8f32;
         let max_l = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);

@@ -3,6 +3,9 @@
 //! Stage 1: Single Euler step GPU validation (COMPLETE)
 //! Stage 2: Full forward pass, load Python weights, validate against Python logits.
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[allow(dead_code)]
 mod backend;
 mod checkpoint;
@@ -56,33 +59,96 @@ fn main() {
             println!("Backend auto-selection test\n");
             for dim in [128, 256, 512, 768, 1024] {
                 print!("  dim={dim}: ");
-                let _ = backend::auto_select(dim, false, false);
+                let _ = backend::auto_select(dim, false, false, None);
             }
             println!();
             print!("  dim=128 --force-gpu: ");
-            let _ = backend::auto_select(128, false, true);
+            let _ = backend::auto_select(128, false, true, None);
             print!("  dim=1024 --force-cpu: ");
-            let _ = backend::auto_select(1024, true, false);
+            let _ = backend::auto_select(1024, true, false, None);
         }
         Some("grad-test") => {
             // Stage 3: gradient validation
             let test_path = args.get(2).map(|s| s.as_str()).unwrap_or("reference/gradient_test.bin");
             grad_test::validate_gradients(test_path);
         }
+        Some("list-gpus") => {
+            list_gpus();
+        }
         Some("train") => {
             // Stage 4: training from scratch (or resume from checkpoint)
             let use_curriculum = !args.iter().any(|a| a == "--no-curriculum");
             let word_level = args.iter().any(|a| a == "--word");
+            let force_cpu = args.iter().any(|a| a == "--cpu");
+            let force_gpu = args.iter().any(|a| a == "--gpu");
             let resume_path = args.iter()
                 .position(|a| a == "--resume")
                 .and_then(|i| args.get(i + 1))
                 .map(|s| s.to_string());
+            let seed: u64 = args.iter()
+                .position(|a| a == "--seed")
+                .and_then(|i| args.get(i + 1))
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(42);
+            let train_seed: u64 = args.iter()
+                .position(|a| a == "--train-seed")
+                .and_then(|i| args.get(i + 1))
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(seed + 1295);
+            let threads: Option<usize> = args.iter()
+                .position(|a| a == "--threads")
+                .and_then(|i| args.get(i + 1))
+                .and_then(|s| s.parse().ok());
+            let gpu_device: Option<usize> = args.iter()
+                .position(|a| a == "--gpu-device")
+                .and_then(|i| args.get(i + 1))
+                .and_then(|s| s.parse().ok());
+            // Architecture flags
+            let n_bands: usize = args.iter()
+                .position(|a| a == "--n-bands")
+                .and_then(|i| args.get(i + 1))
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(64);
+            let n_head: usize = args.iter()
+                .position(|a| a == "--n-head")
+                .and_then(|i| args.get(i + 1))
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(4);
+            let n_layers: usize = args.iter()
+                .position(|a| a == "--n-layers")
+                .and_then(|i| args.get(i + 1))
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(4);
+            let maestro_dim: usize = args.iter()
+                .position(|a| a == "--maestro-dim")
+                .and_then(|i| args.get(i + 1))
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(16);
+            let block_size: usize = args.iter()
+                .position(|a| a == "--block-size")
+                .and_then(|i| args.get(i + 1))
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(256);
+            let rk4_steps: usize = args.iter()
+                .position(|a| a == "--rk4-steps")
+                .and_then(|i| args.get(i + 1))
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(8);
+            let model_config = model::ModelConfig {
+                n_bands, n_head, n_layers, maestro_dim, block_size,
+                rk4_n_steps: rk4_steps,
+            };
             // Collect positional args, skipping flags and their values
+            let flags_with_values = [
+                "--resume", "--seed", "--train-seed", "--threads",
+                "--n-bands", "--n-head", "--n-layers", "--maestro-dim",
+                "--block-size", "--rk4-steps", "--gpu-device",
+            ];
             let mut positional: Vec<&str> = Vec::new();
             let mut skip_next = false;
             for a in &args[2..] {
                 if skip_next { skip_next = false; continue; }
-                if a == "--resume" { skip_next = true; continue; }
+                if flags_with_values.contains(&a.as_str()) { skip_next = true; continue; }
                 if a.starts_with("--") { continue; }
                 positional.push(a);
             }
@@ -101,6 +167,13 @@ fn main() {
                 word_level,
                 resume_path,
                 checkpoint_every: 500,
+                model_seed: seed,
+                train_seed,
+                threads,
+                force_cpu,
+                force_gpu,
+                gpu_device,
+                model_config,
             });
         }
         _ => {
@@ -109,7 +182,12 @@ fn main() {
             println!("  kerr-engine gpu-backend-test      GPU backend: validate all primitives vs CPU");
             println!("  kerr-engine validate <model.bin>  Stage 2: full forward pass validation");
             println!("  kerr-engine grad-test [test.bin]  Stage 3: gradient validation");
-            println!("  kerr-engine train [data] [iters] [batch] [seq_len] [lr] [--no-curriculum] [--word] [--resume FILE]");
+            println!("  kerr-engine list-gpus             List available GPU adapters");
+            println!("  kerr-engine train [data] [iters] [batch] [seq_len] [lr] [flags]");
+            println!("    Training flags: --seed N, --train-seed N, --threads N, --cpu, --gpu");
+            println!("    --no-curriculum, --word, --resume FILE, --gpu-device N");
+            println!("    Architecture:   --n-bands N, --n-head N, --n-layers N, --maestro-dim N");
+            println!("    --block-size N, --rk4-steps N");
             println!("                                    Stage 4: train from scratch (or resume)");
         }
     }
@@ -222,6 +300,22 @@ fn validate_forward_pass(weights_path: &str, test_path: &str) {
         println!("  FAIL: Rust differs from Python by {:.2e}.", max_diff);
         println!("  Validation gate NOT cleared. Debug required.");
     }
+}
+
+fn list_gpus() {
+    println!("Available GPU adapters:\n");
+    let instance = wgpu::Instance::default();
+    let adapters = instance.enumerate_adapters(wgpu::Backends::all());
+    if adapters.is_empty() {
+        println!("  No GPU adapters found.");
+        return;
+    }
+    for (i, adapter) in adapters.iter().enumerate() {
+        let info = adapter.get_info();
+        println!("  [{}] {} ({:?})", i, info.name, info.backend);
+        println!("      Device type: {:?}", info.device_type);
+    }
+    println!("\nUse --gpu-device N to select a specific adapter.");
 }
 
 /// Simple Euler step for Stage 1 GPU validation (not the full Kerr-ODE).

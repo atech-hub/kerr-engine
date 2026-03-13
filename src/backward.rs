@@ -43,8 +43,25 @@ pub fn linear_backward(
     (d_x, d_w, d_b)
 }
 
+/// Backward through linear: compute only d_x = W^T @ d_y.
+/// Used by ComputeBackend — d_w and d_b are accumulated separately on CPU.
+pub fn linear_backward_dx_only(d_y: &[f32], w: &[Vec<f32>]) -> Vec<f32> {
+    let out_dim = w.len();
+    let in_dim = w[0].len();
+    let mut d_x = vec![0.0f32; in_dim];
+    for j in 0..in_dim {
+        let mut sum = 0.0f32;
+        for i in 0..out_dim {
+            sum += d_y[i] * w[i][j];
+        }
+        d_x[j] = sum;
+    }
+    d_x
+}
+
 /// Backward through y = W @ x (no bias, for lm_head)
 /// Returns (d_x, d_w)
+#[allow(dead_code)]
 pub fn linear_no_bias_backward(
     d_y: &[f32],
     x: &[f32],
@@ -361,31 +378,36 @@ pub fn rk4_step_backward(
     (d_r, d_s, d_gamma_acc, d_omega_acc, d_alpha_acc, d_beta_acc)
 }
 
-/// Backward through the full Kerr-ODE (8 RK4 steps).
+/// Backward through the full Kerr-ODE (rk4_n_steps RK4 steps).
 pub fn kerr_ode_backward(
-    d_output: &[f32],  // [N_EMBD] gradient from downstream
-    input: &[f32],     // [N_EMBD] original input (saved from forward)
+    d_output: &[f32],  // [n_embd] gradient from downstream
+    input: &[f32],     // [n_embd] original input (saved from forward)
     weights: &KerrWeights,
 ) -> (Vec<f32>, Vec<f32>, Vec<f32>, f32, f32) {
+    let n_bands = weights.gamma_raw.len();
+    let n_embd = n_bands * 2;
+    let n_steps = weights.rk4_n_steps;
+    let dt = 1.0 / n_steps as f32;
+
     // Split d_output into d_r, d_s
-    let mut d_r: Vec<f32> = (0..N_BANDS).map(|k| d_output[k * 2]).collect();
-    let mut d_s: Vec<f32> = (0..N_BANDS).map(|k| d_output[k * 2 + 1]).collect();
+    let mut d_r: Vec<f32> = (0..n_bands).map(|k| d_output[k * 2]).collect();
+    let mut d_s: Vec<f32> = (0..n_bands).map(|k| d_output[k * 2 + 1]).collect();
 
     // Recompute forward states for each RK4 step
-    let mut r: Vec<f32> = (0..N_BANDS).map(|k| input[k * 2]).collect();
-    let mut s: Vec<f32> = (0..N_BANDS).map(|k| input[k * 2 + 1]).collect();
+    let mut r: Vec<f32> = (0..n_bands).map(|k| input[k * 2]).collect();
+    let mut s: Vec<f32> = (0..n_bands).map(|k| input[k * 2 + 1]).collect();
 
     let gamma: Vec<f32> = weights.gamma_raw.iter().map(|&g| {
         if g > 20.0 { g } else { (1.0 + g.exp()).ln() }
     }).collect();
 
     // Save all intermediate states
-    let mut states: Vec<(Vec<f32>, Vec<f32>)> = Vec::with_capacity(RK4_N_STEPS + 1);
+    let mut states: Vec<(Vec<f32>, Vec<f32>)> = Vec::with_capacity(n_steps + 1);
     states.push((r.clone(), s.clone()));
 
-    for _ in 0..RK4_N_STEPS {
+    for _ in 0..n_steps {
         let (r_new, s_new) = crate::model::rk4_step_public(
-            &r, &s, RK4_DT, &gamma, &weights.omega, weights.alpha, weights.beta,
+            &r, &s, dt, &gamma, &weights.omega, weights.alpha, weights.beta,
         );
         r = r_new;
         s = s_new;
@@ -393,26 +415,26 @@ pub fn kerr_ode_backward(
     }
 
     // Backward through steps in reverse
-    let mut d_gamma_raw_acc = vec![0.0f32; N_BANDS];
-    let mut d_omega_acc = vec![0.0f32; N_BANDS];
+    let mut d_gamma_raw_acc = vec![0.0f32; n_bands];
+    let mut d_omega_acc = vec![0.0f32; n_bands];
     let mut d_alpha_acc = 0.0f32;
     let mut d_beta_acc = 0.0f32;
 
-    for step in (0..RK4_N_STEPS).rev() {
+    for step in (0..n_steps).rev() {
         let (ref r_step, ref s_step) = states[step];
 
         let (d_r_new, d_s_new, d_gamma, d_omega, d_alpha, d_beta) =
             rk4_step_backward(
                 &d_r, &d_s,
                 r_step, s_step,
-                RK4_DT,
+                dt,
                 &gamma, &weights.omega,
                 weights.alpha, weights.beta,
             );
 
         d_r = d_r_new;
         d_s = d_s_new;
-        for k in 0..N_BANDS {
+        for k in 0..n_bands {
             d_gamma_raw_acc[k] += d_gamma[k];
             d_omega_acc[k] += d_omega[k];
         }
@@ -421,13 +443,13 @@ pub fn kerr_ode_backward(
     }
 
     // Chain through softplus for gamma_raw
-    let d_gamma_raw: Vec<f32> = (0..N_BANDS)
+    let d_gamma_raw: Vec<f32> = (0..n_bands)
         .map(|k| softplus_backward(d_gamma_raw_acc[k], weights.gamma_raw[k]))
         .collect();
 
     // Reinterleave d_r, d_s -> d_input
-    let mut d_input = vec![0.0f32; N_EMBD];
-    for k in 0..N_BANDS {
+    let mut d_input = vec![0.0f32; n_embd];
+    for k in 0..n_bands {
         d_input[k * 2] = d_r[k];
         d_input[k * 2 + 1] = d_s[k];
     }
@@ -440,20 +462,22 @@ pub fn kerr_ode_backward(
 /// Backward through causal self-attention for a single query position.
 /// This is the full attention backward — scores, softmax, value aggregation.
 pub fn attention_backward_single(
-    d_out: &[f32],           // [N_EMBD] gradient for this position
-    q_all: &[Vec<f32>],     // [T][N_EMBD] all queries
-    k_all: &[Vec<f32>],     // [T][N_EMBD] all keys
-    v_all: &[Vec<f32>],     // [T][N_EMBD] all values
-    att_weights: &[Vec<f32>], // [N_HEAD][T] post-softmax weights per head at this position
+    d_out: &[f32],           // [n_embd] gradient for this position
+    q_all: &[Vec<f32>],     // [T][n_embd] all queries
+    k_all: &[Vec<f32>],     // [T][n_embd] all keys
+    v_all: &[Vec<f32>],     // [T][n_embd] all values
+    att_weights: &[Vec<f32>], // [n_head][T] post-softmax weights per head at this position
     pos: usize,              // which position we're computing grad for
     d_q_all: &mut [Vec<f32>],
     d_k_all: &mut [Vec<f32>],
     d_v_all: &mut [Vec<f32>],
 ) {
-    let scale = 1.0 / (HEAD_DIM as f32).sqrt();
+    let n_head = att_weights.len();
+    let head_dim = d_out.len() / n_head;
+    let scale = 1.0 / (head_dim as f32).sqrt();
 
-    for head in 0..N_HEAD {
-        let offset = head * HEAD_DIM;
+    for head in 0..n_head {
+        let offset = head * head_dim;
         let att = &att_weights[head]; // attention weights for this head at this position
 
         // Backward through: out[pos][offset+d] = sum_ki att[ki] * v[ki][offset+d]
@@ -462,7 +486,7 @@ pub fn attention_backward_single(
         let mut d_att = vec![0.0f32; pos + 1];
         for ki in 0..=pos {
             let mut dot = 0.0f32;
-            for d in 0..HEAD_DIM {
+            for d in 0..head_dim {
                 dot += d_out[offset + d] * v_all[ki][offset + d];
                 d_v_all[ki][offset + d] += att[ki] * d_out[offset + d];
             }
@@ -481,7 +505,7 @@ pub fn attention_backward_single(
         // d_q[pos][d] += d_score[ki] * k[ki][d] * scale
         // d_k[ki][d] += d_score[ki] * q[pos][d] * scale
         for ki in 0..=pos {
-            for d in 0..HEAD_DIM {
+            for d in 0..head_dim {
                 d_q_all[pos][offset + d] += d_score[ki] * k_all[ki][offset + d] * scale;
                 d_k_all[ki][offset + d] += d_score[ki] * q_all[pos][offset + d] * scale;
             }
