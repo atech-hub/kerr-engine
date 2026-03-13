@@ -244,6 +244,29 @@ At 128-dim, CPU wins. The GPU persistent pipeline eliminates 99.7% of dispatch o
 
 ---
 
+## Model compatibility
+
+The Kerr-ODE is a novel architecture — it is NOT a standard transformer and does NOT work with existing inference clients out of the box.
+
+**What won't work today:**
+- LM Studio, Ollama, llama.cpp — these expect dense MLP feed-forward layers. The Kerr-ODE uses RK4 integration with neighbour coupling, which no existing runtime supports.
+- Hugging Face Transformers — no Kerr-ODE model class exists in the library.
+- GGUF/GGML export — the format has no representation for ODE integration steps or stencil coupling.
+
+**What works today:**
+- The engine itself. Train a model, generate text, checkpoint and resume — all within the engine's CLI. The `generate()` function runs autoregressive inference through the same `ComputeBackend` used for training.
+
+**What's needed for ecosystem integration:**
+- An OpenAI-compatible API server wrapping the engine (simplest path — any chat UI that speaks the OpenAI API could connect)
+- A GGUF exporter with custom Kerr-ODE operators and a corresponding llama.cpp fork
+- A Hugging Face model class implementing the Kerr-ODE forward pass
+
+These are documented as defensive publications in the parent project's [ENGINE-PATTERNS.md](https://github.com/atech-hub/Wave-Coherence-as-a-Computational-Primitive/blob/main/ENGINE-PATTERNS.md) (Pattern 68) to prevent patent enclosure. Anyone can build them.
+
+If you're interested in building a connector, the engine's `model.rs` forward pass and `generate()` function in `train.rs` are the reference implementations.
+
+---
+
 ## Project structure
 
 ```
