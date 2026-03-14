@@ -186,13 +186,21 @@ impl ModelWeights {
     }
 
     fn forward_block_with_cache(&self, block: &BlockWeights, hidden: &[Vec<f32>], backend: &dyn ComputeBackend) -> BlockCache {
+        // Forward timing instrumentation — set to true for forward profiling
+        const FWD_TIMING: bool = false;
+        let _fwd_t0 = std::time::Instant::now();
+
         let t = hidden.len();
         let n_embd = hidden[0].len();
 
         let normed_1 = backend.layer_norm_batch(hidden, &block.ln_1.weight, &block.ln_1.bias);
+        if FWD_TIMING { eprintln!("    [fwd] LN1:       {:?}", _fwd_t0.elapsed()); }
 
+        let _t1 = std::time::Instant::now();
         let (attn_out, attn_cache) = self.attention_with_cache(&block.attn, &normed_1, backend);
+        if FWD_TIMING { eprintln!("    [fwd] Attention:  {:?}", _t1.elapsed()); }
 
+        let _t2 = std::time::Instant::now();
         let h1: Vec<Vec<f32>> = (0..t).map(|i| {
             let mut v = vec![0.0f32; n_embd];
             for j in 0..n_embd { v[j] = hidden[i][j] + attn_out[i][j]; }
@@ -200,17 +208,21 @@ impl ModelWeights {
         }).collect();
 
         let normed_2 = backend.layer_norm_batch(&h1, &block.ln_2.weight, &block.ln_2.bias);
+        if FWD_TIMING { eprintln!("    [fwd] Residual+LN2: {:?}", _t2.elapsed()); }
 
+        let _t3 = std::time::Instant::now();
         let ffn_out = match &block.ffn {
             FfnWeights::PerBand(w) => backend.per_band_linear(w, &normed_2),
             FfnWeights::KerrMaestro(w) => backend.kerr_maestro_add(w, &normed_2),
         };
+        if FWD_TIMING { eprintln!("    [fwd] FFN:       {:?}", _t3.elapsed()); }
 
         let output: Vec<Vec<f32>> = (0..t).map(|i| {
             let mut v = vec![0.0f32; n_embd];
             for j in 0..n_embd { v[j] = h1[i][j] + ffn_out[i][j]; }
             v
         }).collect();
+        if FWD_TIMING { eprintln!("    [fwd] TOTAL:     {:?}", _fwd_t0.elapsed()); }
 
         BlockCache {
             input: hidden.to_vec(),
@@ -223,6 +235,9 @@ impl ModelWeights {
     }
 
     fn attention_with_cache(&self, weights: &AttentionWeights, x: &[Vec<f32>], backend: &dyn ComputeBackend) -> (Vec<Vec<f32>>, AttnCache) {
+        const ATTN_TIMING: bool = false;
+        let _at0 = std::time::Instant::now();
+
         let t = x.len();
         let n_embd = x[0].len();
         let n_head = weights.n_head;
@@ -231,6 +246,7 @@ impl ModelWeights {
 
         // Batched QKV projection: 1 call instead of T separate calls
         let qkv_all = backend.linear_batch(&weights.c_attn.w, &weights.c_attn.b, x);
+        if ATTN_TIMING { eprintln!("      [attn] QKV proj:    {:?}", _at0.elapsed()); }
 
         let mut q_all = vec![vec![0.0f32; n_embd]; t];
         let mut k_all = vec![vec![0.0f32; n_embd]; t];
@@ -251,6 +267,7 @@ impl ModelWeights {
         // Pre-allocate attention scratch — reused across all heads and positions
         let mut att = vec![0.0f32; t];
 
+        let _at1 = std::time::Instant::now();
         for head in 0..n_head {
             let offset = head * head_dim;
             for qi in 0..t {
@@ -288,8 +305,12 @@ impl ModelWeights {
             }
         }
 
+        if ATTN_TIMING { eprintln!("      [attn] Head loop:   {:?}", _at1.elapsed()); }
+
         // Batched output projection: 1 call instead of T separate calls
+        let _at2 = std::time::Instant::now();
         let result = backend.linear_batch(&weights.c_proj.w, &weights.c_proj.b, &out);
+        if ATTN_TIMING { eprintln!("      [attn] Out proj:    {:?}", _at2.elapsed()); }
         let pre_proj = out; // move, not clone — out not used after this
 
         let cache = AttnCache {

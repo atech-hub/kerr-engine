@@ -148,8 +148,8 @@ Every gradient is hand-derived and verified against PyTorch's automatic differen
 
 | Metric | Value |
 |---|---|
-| GPU utilisation | 49-52% at 47°C |
-| VRAM used | 1.4 / 12.0 GB |
+| GPU utilisation | 35-37% at 46°C |
+| VRAM used | 1.0-1.1 / 12.0 GB |
 | Loss trajectory | 4.28 → 3.07 (50 iters) — correct convergence |
 | Attention backward (GPU) | 4 ms |
 | c_attn weight gradient | 14 ms (28x faster than per-position dispatch) |
@@ -162,7 +162,8 @@ Every gradient is hand-derived and verified against PyTorch's automatic differen
 | c_proj backward | ~200 ms | ~7 ms | 28x |
 | c_attn backward | ~400 ms | ~14 ms | 28x |
 | Attention backward | CPU ~400 ms (est.) | GPU 4 ms | ~100x |
-| Total backward pass | ~4.4 s | ~2.2 s | 2x |
+| FFN backward | ~340 ms | ~277 ms | 1.2x |
+| Total backward pass | ~4.4 s | ~968 ms | 4.5x |
 
 **Optimisation history (128-dim, 200 iters):**
 
@@ -277,7 +278,10 @@ kerr-engine/
 │   ├── pipeline.rs      Cached forward + backward chain (training)
 │   ├── backward.rs      Hand-derived gradient primitives
 │   ├── backend.rs       ComputeBackend trait + CpuBackend + auto-select
-│   ├── gpu_backend.rs   GpuBackend (WGPU, all 8 trait methods)
+│   ├── gpu_backend.rs   Re-export module (thin wrapper)
+│   ├── gpu_pipelines.rs Shader pipeline compilation + GpuBackend struct
+│   ├── gpu_dispatch.rs  ComputeBackend impl for GpuBackend
+│   ├── gpu_validate.rs  GPU validation + benchmarking
 │   ├── gpu_persistent.rs Persistent GPU pipeline (fused RK4)
 │   ├── gpu.rs           Stage 1 GPU validation
 │   ├── train.rs         Training loop, curriculum, eval
@@ -295,7 +299,7 @@ kerr-engine/
 └── LICENSE              Apache 2.0
 ```
 
-~6,500 lines of Rust. 16 modules. 13 compute shaders. 4 dependencies.
+~6,550 lines of Rust. 19 modules. 13 compute shaders. 4 dependencies.
 
 ---
 
@@ -326,9 +330,10 @@ What this means for contributions:
 - **The maintainer merges based on validation results and description, not code review.** Be clear about what you changed and why.
 
 **Known optimisation targets for contributors:**
-- FFN backward batching (~340ms/block at 768-dim, currently per-position on CPU)
+- Attention forward: fused GPU shader (currently CPU triple-nested loop — biggest remaining bottleneck at 768-dim)
+- Attention forward: thread across heads via thread::scope (quick win, 12 heads are independent)
 - Forward pass batched dispatch (same per-position overhead pattern as backward had)
-- Fused attention forward shader (currently CPU loops)
+- Kerr-ODE backward GPU shader (revisit at ~1,500+ bands — currently 6ms/block on CPU, not worth dispatch overhead)
 - SIMD inner loops (viable at 512+ dim, not at 128-dim)
 
 Every gradient is mathematically verified. Every validation gate passes independently. The code is the code — it either works or it doesn't.
