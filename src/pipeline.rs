@@ -458,19 +458,16 @@ impl ModelWeights {
                         for j in 0..n_embd { out_proj_w[i][j] += op_dw[i][j]; }
                         out_proj_b[i] += op_db[i];
                     }
-                    // Phase 3: Kerr-ODE backward per position (accumulate shared grads)
-                    let mut d_input_all = vec![vec![0.0f32; n_embd]; t];
-                    for pos in 0..t {
-                        let (d_kerr_input, d_gr, d_om, d_al, d_be) =
-                            kerr_ode_backward(&d_combined_all[pos], &bc.normed_2[pos], &w.kerr);
-                        for k in 0..n_bands {
-                            gamma_raw[k] += d_gr[k];
-                            omega[k] += d_om[k];
-                        }
-                        *alpha += d_al;
-                        *beta += d_be;
-                        for i in 0..n_embd { d_input_all[pos][i] += d_kerr_input[i]; }
+                    // Phase 3: Kerr-ODE backward (batched across all positions)
+                    let (d_kerr_inputs, d_gr, d_om, d_al, d_be) =
+                        backend.kerr_ode_backward_batch(&d_combined_all, &bc.normed_2, &w.kerr);
+                    for k in 0..n_bands {
+                        gamma_raw[k] += d_gr[k];
+                        omega[k] += d_om[k];
                     }
+                    *alpha += d_al;
+                    *beta += d_be;
+                    let mut d_input_all = d_kerr_inputs;
                     // Phase 4: Batched maestro backward
                     // Forward recompute squeeze + GELU for all positions
                     let squeezed_all: Vec<Vec<f32>> = (0..t).map(|pos| {

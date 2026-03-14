@@ -120,6 +120,40 @@ pub trait ComputeBackend {
         xs.iter().map(|x| self.layer_norm(x, weight, bias)).collect()
     }
 
+    /// Batched Kerr-ODE backward: all positions in one call.
+    /// d_outputs: [n_pos][n_embd], inputs: [n_pos][n_embd].
+    /// Returns (d_inputs, d_gamma_raw, d_omega, d_alpha, d_beta).
+    fn kerr_ode_backward_batch(
+        &self,
+        d_outputs: &[Vec<f32>],
+        inputs: &[Vec<f32>],
+        weights: &KerrWeights,
+    ) -> (Vec<Vec<f32>>, Vec<f32>, Vec<f32>, f32, f32) {
+        // Default: loop per-position calling CPU backward
+        let n_pos = d_outputs.len();
+        let n_bands = weights.gamma_raw.len();
+        let n_embd = n_bands * 2;
+        let mut d_inputs = vec![vec![0.0f32; n_embd]; n_pos];
+        let mut d_gamma_raw = vec![0.0f32; n_bands];
+        let mut d_omega = vec![0.0f32; n_bands];
+        let mut d_alpha = 0.0f32;
+        let mut d_beta = 0.0f32;
+
+        for pos in 0..n_pos {
+            let (d_input, d_gr, d_om, d_al, d_be) =
+                crate::backward::kerr_ode_backward(&d_outputs[pos], &inputs[pos], weights);
+            d_inputs[pos] = d_input;
+            for k in 0..n_bands {
+                d_gamma_raw[k] += d_gr[k];
+                d_omega[k] += d_om[k];
+            }
+            d_alpha += d_al;
+            d_beta += d_be;
+        }
+
+        (d_inputs, d_gamma_raw, d_omega, d_alpha, d_beta)
+    }
+
     // ─── Backward operations ─────────────────────────────────────
 
     /// Backward through linear: d_x = W^T @ d_y

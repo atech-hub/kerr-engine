@@ -194,6 +194,15 @@ impl ComputeBackend for GpuBackend {
         y_flat.chunks(dim).map(|c| c.to_vec()).collect()
     }
 
+    fn kerr_ode_backward_batch(
+        &self,
+        d_outputs: &[Vec<f32>],
+        inputs: &[Vec<f32>],
+        weights: &KerrWeights,
+    ) -> (Vec<Vec<f32>>, Vec<f32>, Vec<f32>, f32, f32) {
+        self.gpu_kerr_ode_backward_batch(d_outputs, inputs, weights)
+    }
+
     fn linear_backward_dx(&self, d_y: &[f32], w: &[Vec<f32>]) -> Vec<f32> {
         let out_dim = w.len();
         let in_dim = if out_dim > 0 { w[0].len() } else { return vec![] };
