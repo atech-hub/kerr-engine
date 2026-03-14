@@ -38,6 +38,15 @@ pub struct GpuBackend {
     // Batched matvec backward: d_x[pos] = W^T @ d_y[pos] for all positions
     pub(crate) matvec_bwd_batch_pipeline: wgpu::ComputePipeline,
     pub(crate) matvec_bwd_batch_layout: wgpu::BindGroupLayout,
+    // Batched matvec forward: y[pos] = W @ x[pos] + b for all positions
+    pub(crate) matvec_batch_pipeline: wgpu::ComputePipeline,
+    pub(crate) matvec_batch_layout: wgpu::BindGroupLayout,
+    // Batched layer norm: one workgroup per position
+    pub(crate) layer_norm_batch_pipeline: wgpu::ComputePipeline,
+    pub(crate) layer_norm_batch_layout: wgpu::BindGroupLayout,
+    // Batched Kerr derivative: all positions in one dispatch
+    pub(crate) kerr_deriv_batch_pipeline: wgpu::ComputePipeline,
+    pub(crate) kerr_deriv_batch_layout: wgpu::BindGroupLayout,
 }
 
 // ─── Uniform param structs ──────────────────────────────────────
@@ -112,6 +121,33 @@ pub(crate) struct MatvecBwdBatchParams {
     pub in_dim: u32,
     pub n_pos: u32,
     pub _pad: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+pub(crate) struct MatvecBatchParams {
+    pub out_dim: u32,
+    pub in_dim: u32,
+    pub n_pos: u32,
+    pub use_bias: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+pub(crate) struct LayerNormBatchParams {
+    pub dim: u32,
+    pub n_pos: u32,
+    pub _pad1: u32,
+    pub _pad2: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+pub(crate) struct KerrDerivBatchParams {
+    pub n_bands: u32,
+    pub n_pos: u32,
+    pub _pad1: u32,
+    pub _pad2: u32,
 }
 
 // ─── Helper: build bind group layout entries ────────────────────
@@ -490,6 +526,85 @@ impl GpuBackend {
             cache: None,
         });
 
+        // ─── Compile batched matvec forward shader ─────────────────
+        let mvb_fwd_src = include_str!("../shaders/matvec_batch.wgsl");
+        let mvb_fwd_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("matvec_batch"),
+            source: wgpu::ShaderSource::Wgsl(mvb_fwd_src.into()),
+        });
+        // bindings: 0=w(ro), 1=x(ro), 2=b(ro), 3=y(rw), 4=params(uniform)
+        let matvec_batch_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("matvec_batch_layout"),
+            entries: &[storage_ro(0), storage_ro(1), storage_ro(2), storage_rw(3), uniform_entry(4)],
+        });
+        let mvb_fwd_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("matvec_batch_pl"),
+            bind_group_layouts: &[&matvec_batch_layout],
+            push_constant_ranges: &[],
+        });
+        let matvec_batch_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("matvec_batch_pipeline"),
+            layout: Some(&mvb_fwd_pl),
+            module: &mvb_fwd_module,
+            entry_point: Some("matvec_batch"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        // ─── Compile batched layer norm shader ──────────────────────
+        let lnb_fwd_src = include_str!("../shaders/layer_norm_batch.wgsl");
+        let lnb_fwd_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("layer_norm_batch"),
+            source: wgpu::ShaderSource::Wgsl(lnb_fwd_src.into()),
+        });
+        // bindings: 0=x(ro), 1=weight(ro), 2=bias(ro), 3=y(rw), 4=params(uniform)
+        let layer_norm_batch_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("layer_norm_batch_layout"),
+            entries: &[storage_ro(0), storage_ro(1), storage_ro(2), storage_rw(3), uniform_entry(4)],
+        });
+        let lnb_fwd_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("layer_norm_batch_pl"),
+            bind_group_layouts: &[&layer_norm_batch_layout],
+            push_constant_ranges: &[],
+        });
+        let layer_norm_batch_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("layer_norm_batch_pipeline"),
+            layout: Some(&lnb_fwd_pl),
+            module: &lnb_fwd_module,
+            entry_point: Some("layer_norm_batch"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        // ─── Compile batched Kerr derivative shader ─────────────────
+        let kdb_src = include_str!("../shaders/kerr_step_batch.wgsl");
+        let kdb_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("kerr_derivative_batch"),
+            source: wgpu::ShaderSource::Wgsl(kdb_src.into()),
+        });
+        // bindings: same as kerr_step — 0=r(ro), 1=s(ro), 2=dr(rw), 3=ds(rw),
+        //           4=gamma(ro), 5=omega(ro), 6=params(uniform), 7=alpha_beta(ro)
+        let kerr_deriv_batch_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("kerr_deriv_batch_layout"),
+            entries: &[
+                storage_ro(0), storage_ro(1), storage_rw(2), storage_rw(3),
+                storage_ro(4), storage_ro(5), uniform_entry(6), storage_ro(7),
+            ],
+        });
+        let kdb_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("kerr_deriv_batch_pl"),
+            bind_group_layouts: &[&kerr_deriv_batch_layout],
+            push_constant_ranges: &[],
+        });
+        let kerr_deriv_batch_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("kerr_deriv_batch_pipeline"),
+            layout: Some(&kdb_pl),
+            module: &kdb_module,
+            entry_point: Some("kerr_derivative_batch"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
         Self {
             device,
             queue,
@@ -513,6 +628,12 @@ impl GpuBackend {
             outer_product_layout,
             matvec_bwd_batch_pipeline,
             matvec_bwd_batch_layout,
+            matvec_batch_pipeline,
+            matvec_batch_layout,
+            layer_norm_batch_pipeline,
+            layer_norm_batch_layout,
+            kerr_deriv_batch_pipeline,
+            kerr_deriv_batch_layout,
         }
     }
 
@@ -751,5 +872,189 @@ impl GpuBackend {
             out[k * 2 + 1] = s[k];
         }
         out
+    }
+
+    /// Batched matvec forward: y[pos] = W @ x[pos] + b for all positions in one dispatch.
+    pub(crate) fn gpu_matvec_batch(&self, w_flat: &[f32], x_flat: &[f32], b: &[f32], out_dim: usize, in_dim: usize, n_pos: usize) -> Vec<f32> {
+        let use_bias = if b.is_empty() { 0u32 } else { 1u32 };
+
+        let w_buf = self.storage_buf("mvb_w", w_flat);
+        let x_buf = self.storage_buf("mvb_x", x_flat);
+        let b_data = if b.is_empty() { &[0.0f32][..] } else { b };
+        let b_buf = self.storage_buf("mvb_b", b_data);
+        let y_buf = self.output_buf("mvb_y", n_pos * out_dim);
+        let params = MatvecBatchParams {
+            out_dim: out_dim as u32, in_dim: in_dim as u32,
+            n_pos: n_pos as u32, use_bias,
+        };
+        let params_buf = self.uniform_buf("mvb_params", &params);
+
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("matvec_batch_bg"),
+            layout: &self.matvec_batch_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: w_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: x_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: b_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: y_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: params_buf.as_entire_binding() },
+            ],
+        });
+
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&self.matvec_batch_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            let total = (n_pos * out_dim) as u32;
+            pass.dispatch_workgroups((total + 63) / 64, 1, 1);
+        }
+        self.queue.submit(Some(encoder.finish()));
+
+        self.readback(&y_buf, n_pos * out_dim)
+    }
+
+    /// Batched layer norm: one workgroup per position, all positions in one dispatch.
+    pub(crate) fn gpu_layer_norm_batch(&self, x_flat: &[f32], weight: &[f32], bias: &[f32], dim: usize, n_pos: usize) -> Vec<f32> {
+        let x_buf = self.storage_buf("lnb_x", x_flat);
+        let w_buf = self.storage_buf("lnb_w", weight);
+        let b_buf = self.storage_buf("lnb_b", bias);
+        let y_buf = self.output_buf("lnb_y", n_pos * dim);
+        let params = LayerNormBatchParams {
+            dim: dim as u32, n_pos: n_pos as u32, _pad1: 0, _pad2: 0,
+        };
+        let params_buf = self.uniform_buf("lnb_params", &params);
+
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("layer_norm_batch_bg"),
+            layout: &self.layer_norm_batch_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: x_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: w_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: b_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: y_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: params_buf.as_entire_binding() },
+            ],
+        });
+
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&self.layer_norm_batch_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(n_pos as u32, 1, 1);
+        }
+        self.queue.submit(Some(encoder.finish()));
+
+        self.readback(&y_buf, n_pos * dim)
+    }
+
+    /// Batched Kerr derivative: compute dr/ds for all positions in one dispatch.
+    /// r_flat/s_flat are [n_pos * n_bands]. Returns (dr_flat, ds_flat).
+    pub(crate) fn gpu_kerr_derivative_batch(
+        &self, r_flat: &[f32], s_flat: &[f32],
+        gamma: &[f32], omega: &[f32], alpha: f32, beta: f32,
+        n_bands: usize, n_pos: usize,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let r_buf = self.storage_buf("kdb_r", r_flat);
+        let s_buf = self.storage_buf("kdb_s", s_flat);
+        let dr_buf = self.output_buf("kdb_dr", n_pos * n_bands);
+        let ds_buf = self.output_buf("kdb_ds", n_pos * n_bands);
+        let gamma_buf = self.storage_buf("kdb_gamma", gamma);
+        let omega_buf = self.storage_buf("kdb_omega", omega);
+        let params = KerrDerivBatchParams {
+            n_bands: n_bands as u32, n_pos: n_pos as u32, _pad1: 0, _pad2: 0,
+        };
+        let params_buf = self.uniform_buf("kdb_params", &params);
+        let ab = [alpha, beta];
+        let ab_buf = self.storage_buf("kdb_ab", &ab);
+
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("kerr_deriv_batch_bg"),
+            layout: &self.kerr_deriv_batch_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: r_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: s_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: dr_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: ds_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: gamma_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: omega_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: params_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 7, resource: ab_buf.as_entire_binding() },
+            ],
+        });
+
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&self.kerr_deriv_batch_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            let total = (n_pos * n_bands) as u32;
+            pass.dispatch_workgroups((total + 63) / 64, 1, 1);
+        }
+        self.queue.submit(Some(encoder.finish()));
+
+        let dr = self.readback(&dr_buf, n_pos * n_bands);
+        let ds = self.readback(&ds_buf, n_pos * n_bands);
+        (dr, ds)
+    }
+
+    /// Batched Kerr-ODE forward: RK4 integration for all positions simultaneously.
+    /// x is [n_pos][n_embd] interleaved. Returns [n_pos][n_embd].
+    pub(crate) fn gpu_kerr_ode_batch(&self, weights: &KerrWeights, xs: &[Vec<f32>]) -> Vec<Vec<f32>> {
+        let n_pos = xs.len();
+        let n_bands = weights.gamma_raw.len();
+        let n_embd = n_bands * 2;
+        let n_steps = weights.rk4_n_steps;
+        let dt = 1.0 / n_steps as f32;
+
+        // Unpack all positions: interleaved → separate r, s flat arrays
+        let mut r = vec![0.0f32; n_pos * n_bands];
+        let mut s = vec![0.0f32; n_pos * n_bands];
+        for pos in 0..n_pos {
+            for k in 0..n_bands {
+                r[pos * n_bands + k] = xs[pos][k * 2];
+                s[pos * n_bands + k] = xs[pos][k * 2 + 1];
+            }
+        }
+
+        fn softplus(x: f32) -> f32 {
+            if x > 20.0 { x } else { (1.0 + x.exp()).ln() }
+        }
+        let gamma: Vec<f32> = weights.gamma_raw.iter().map(|&g| softplus(g)).collect();
+
+        let total = n_pos * n_bands;
+
+        // RK4 integration — 4 derivative evals per step, each batched across all positions
+        for _ in 0..n_steps {
+            let (k1r, k1s) = self.gpu_kerr_derivative_batch(&r, &s, &gamma, &weights.omega, weights.alpha, weights.beta, n_bands, n_pos);
+
+            let r2: Vec<f32> = r.iter().zip(&k1r).map(|(&ri, &k)| ri + 0.5 * dt * k).collect();
+            let s2: Vec<f32> = s.iter().zip(&k1s).map(|(&si, &k)| si + 0.5 * dt * k).collect();
+            let (k2r, k2s) = self.gpu_kerr_derivative_batch(&r2, &s2, &gamma, &weights.omega, weights.alpha, weights.beta, n_bands, n_pos);
+
+            let r3: Vec<f32> = r.iter().zip(&k2r).map(|(&ri, &k)| ri + 0.5 * dt * k).collect();
+            let s3: Vec<f32> = s.iter().zip(&k2s).map(|(&si, &k)| si + 0.5 * dt * k).collect();
+            let (k3r, k3s) = self.gpu_kerr_derivative_batch(&r3, &s3, &gamma, &weights.omega, weights.alpha, weights.beta, n_bands, n_pos);
+
+            let r4: Vec<f32> = r.iter().zip(&k3r).map(|(&ri, &k)| ri + dt * k).collect();
+            let s4: Vec<f32> = s.iter().zip(&k3s).map(|(&si, &k)| si + dt * k).collect();
+            let (k4r, k4s) = self.gpu_kerr_derivative_batch(&r4, &s4, &gamma, &weights.omega, weights.alpha, weights.beta, n_bands, n_pos);
+
+            for i in 0..total {
+                r[i] += dt / 6.0 * (k1r[i] + 2.0 * k2r[i] + 2.0 * k3r[i] + k4r[i]);
+                s[i] += dt / 6.0 * (k1s[i] + 2.0 * k2s[i] + 2.0 * k3s[i] + k4s[i]);
+            }
+        }
+
+        // Re-interleave per position
+        (0..n_pos).map(|pos| {
+            let mut out = vec![0.0f32; n_embd];
+            for k in 0..n_bands {
+                out[k * 2] = r[pos * n_bands + k];
+                out[k * 2 + 1] = s[pos * n_bands + k];
+            }
+            out
+        }).collect()
     }
 }

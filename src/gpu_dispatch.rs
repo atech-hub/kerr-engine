@@ -109,9 +109,9 @@ impl ComputeBackend for GpuBackend {
         let t = x.len();
         let n_bands = weights.band_w.len();
         let n_embd = n_bands * 2;
-        let mut result = Vec::with_capacity(t);
 
-        for pos in 0..t {
+        // Per-band transform is trivial (2x2 per band) — CPU
+        let bands_out_all: Vec<Vec<f32>> = (0..t).map(|pos| {
             let mut bands_out = vec![0.0f32; n_embd];
             for band in 0..n_bands {
                 let r_in = x[pos][band * 2];
@@ -121,31 +121,77 @@ impl ComputeBackend for GpuBackend {
                 bands_out[band * 2] = w[0][0] * r_in + w[1][0] * s_in + b[0];
                 bands_out[band * 2 + 1] = w[0][1] * r_in + w[1][1] * s_in + b[1];
             }
-            // Output projection on GPU
-            let projected = self.linear(&weights.out_proj.w, &weights.out_proj.b, &bands_out);
-            result.push(projected);
-        }
+            bands_out
+        }).collect();
 
-        result
+        // Batched output projection on GPU
+        self.linear_batch(&weights.out_proj.w, &weights.out_proj.b, &bands_out_all)
     }
 
     fn kerr_maestro_add(&self, weights: &KerrMaestroAddWeights, x: &[Vec<f32>]) -> Vec<Vec<f32>> {
         let t = x.len();
         let n_embd = x[0].len();
-        let mut result = Vec::with_capacity(t);
 
-        for pos in 0..t {
-            let kerr_out = self.kerr_ode(&weights.kerr, &x[pos]);
-            let maestro_out = self.maestro(&weights.maestro, &x[pos]);
-            let mut combined = vec![0.0f32; n_embd];
+        // Batched Kerr-ODE: all positions in one dispatch sequence
+        let kerr_outs = self.gpu_kerr_ode_batch(&weights.kerr, x);
+
+        // Batched maestro: squeeze(linear+gelu) → process(linear)
+        let maestro_outs = self.linear_batch(&weights.maestro.squeeze.w, &weights.maestro.squeeze.b, x);
+        let activated: Vec<f32> = maestro_outs.iter()
+            .flat_map(|v| v.iter().map(|&val| gelu_cpu(val)))
+            .collect();
+        let maestro_dim = weights.maestro.squeeze.w.len();
+        let activated_vecs: Vec<Vec<f32>> = activated.chunks(maestro_dim).map(|c| c.to_vec()).collect();
+        let maestro_projected = self.linear_batch(&weights.maestro.process_1.w, &weights.maestro.process_1.b, &activated_vecs);
+
+        // Combine kerr + maestro, then batched out_proj
+        let combined: Vec<Vec<f32>> = (0..t).map(|pos| {
+            let mut c = vec![0.0f32; n_embd];
             for i in 0..n_embd {
-                combined[i] = kerr_out[i] + maestro_out[i];
+                c[i] = kerr_outs[pos][i] + maestro_projected[pos][i];
             }
-            let projected = self.linear(&weights.out_proj.w, &weights.out_proj.b, &combined);
-            result.push(projected);
-        }
+            c
+        }).collect();
 
-        result
+        self.linear_batch(&weights.out_proj.w, &weights.out_proj.b, &combined)
+    }
+
+    fn linear_batch(&self, w: &[Vec<f32>], b: &[f32], xs: &[Vec<f32>]) -> Vec<Vec<f32>> {
+        if xs.is_empty() { return vec![]; }
+        let out_dim = w.len();
+        let in_dim = if out_dim > 0 { w[0].len() } else { return vec![vec![]; xs.len()] };
+        let n_pos = xs.len();
+
+        let mut w_flat = Vec::with_capacity(out_dim * in_dim);
+        for row in w { w_flat.extend_from_slice(row); }
+        let x_flat: Vec<f32> = xs.iter().flat_map(|v| v.iter().copied()).collect();
+
+        let y_flat = self.gpu_matvec_batch(&w_flat, &x_flat, b, out_dim, in_dim, n_pos);
+        y_flat.chunks(out_dim).map(|c| c.to_vec()).collect()
+    }
+
+    fn linear_no_bias_batch(&self, w: &[Vec<f32>], xs: &[Vec<f32>]) -> Vec<Vec<f32>> {
+        if xs.is_empty() { return vec![]; }
+        let out_dim = w.len();
+        let in_dim = if out_dim > 0 { w[0].len() } else { return vec![vec![]; xs.len()] };
+        let n_pos = xs.len();
+
+        let mut w_flat = Vec::with_capacity(out_dim * in_dim);
+        for row in w { w_flat.extend_from_slice(row); }
+        let x_flat: Vec<f32> = xs.iter().flat_map(|v| v.iter().copied()).collect();
+
+        let y_flat = self.gpu_matvec_batch(&w_flat, &x_flat, &[], out_dim, in_dim, n_pos);
+        y_flat.chunks(out_dim).map(|c| c.to_vec()).collect()
+    }
+
+    fn layer_norm_batch(&self, xs: &[Vec<f32>], weight: &[f32], bias: &[f32]) -> Vec<Vec<f32>> {
+        if xs.is_empty() { return vec![]; }
+        let dim = xs[0].len();
+        let n_pos = xs.len();
+
+        let x_flat: Vec<f32> = xs.iter().flat_map(|v| v.iter().copied()).collect();
+        let y_flat = self.gpu_layer_norm_batch(&x_flat, weight, bias, dim, n_pos);
+        y_flat.chunks(dim).map(|c| c.to_vec()).collect()
     }
 
     fn linear_backward_dx(&self, d_y: &[f32], w: &[Vec<f32>]) -> Vec<f32> {
