@@ -4,6 +4,7 @@
 
 pub mod model;
 pub mod backend;
+pub mod bpe;
 pub mod checkpoint;
 pub mod data;
 pub mod init;

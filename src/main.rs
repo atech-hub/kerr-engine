@@ -8,6 +8,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[allow(dead_code)]
 mod backend;
+mod bpe;
 mod checkpoint;
 mod backward;
 mod data;
@@ -137,6 +138,10 @@ fn main() {
                 .and_then(|i| args.get(i + 1))
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(8);
+            let bpe_path: Option<String> = args.iter()
+                .position(|a| a == "--bpe")
+                .and_then(|i| args.get(i + 1))
+                .map(|s| s.to_string());
             let model_config = model::ModelConfig {
                 n_bands, n_head, n_layers, maestro_dim, block_size,
                 rk4_n_steps: rk4_steps,
@@ -145,7 +150,7 @@ fn main() {
             let flags_with_values = [
                 "--resume", "--seed", "--train-seed", "--threads",
                 "--n-bands", "--n-head", "--n-layers", "--maestro-dim",
-                "--block-size", "--rk4-steps", "--gpu-device",
+                "--block-size", "--rk4-steps", "--gpu-device", "--bpe",
             ];
             let mut positional: Vec<&str> = Vec::new();
             let mut skip_next = false;
@@ -168,6 +173,7 @@ fn main() {
                 lr,
                 use_curriculum,
                 word_level,
+                bpe_path,
                 resume_path,
                 checkpoint_every: 500,
                 model_seed: seed,
@@ -188,7 +194,7 @@ fn main() {
             println!("  kerr-engine list-gpus             List available GPU adapters");
             println!("  kerr-engine train [data] [iters] [batch] [seq_len] [lr] [flags]");
             println!("    Training flags: --seed N, --train-seed N, --threads N, --cpu, --gpu");
-            println!("    --no-curriculum, --word, --resume FILE, --gpu-device N");
+            println!("    --no-curriculum, --word, --bpe FILE, --resume FILE, --gpu-device N");
             println!("    Architecture:   --n-bands N, --n-head N, --n-layers N, --maestro-dim N");
             println!("    --block-size N, --rk4-steps N");
             println!("                                    Stage 4: train from scratch (or resume)");

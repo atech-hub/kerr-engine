@@ -1,7 +1,8 @@
-//! Dataset with train/val split — supports character-level and word-level tokenization.
+//! Dataset with train/val split — supports character-level, word-level, and BPE tokenization.
 
 use std::collections::HashMap;
 use std::fs;
+use crate::bpe::BpeTokenizer;
 use crate::rng::Rng;
 
 pub struct Dataset {
@@ -11,12 +12,14 @@ pub struct Dataset {
     pub token_to_idx: HashMap<String, usize>,
     pub idx_to_token: Vec<String>,
     pub mode: TokenMode,
+    pub bpe: Option<BpeTokenizer>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum TokenMode {
     Char,
     Word,
+    Bpe,
 }
 
 impl Dataset {
@@ -49,7 +52,7 @@ impl Dataset {
         println!("  Dataset [char]: {} tokens (train={}, val={}), vocab_size={}",
             data.len(), train_data.len(), val_data.len(), vocab_size);
 
-        Self { train_data, val_data, vocab_size, token_to_idx, idx_to_token, mode: TokenMode::Char }
+        Self { train_data, val_data, vocab_size, token_to_idx, idx_to_token, mode: TokenMode::Char, bpe: None }
     }
 
     /// Word-level tokenizer: whitespace split, lowercase, min_count threshold.
@@ -93,7 +96,32 @@ impl Dataset {
         println!("  Dataset [word]: {} tokens (train={}, val={}), vocab_size={}, unk={}",
             data.len(), train_data.len(), val_data.len(), vocab_size, unk_count);
 
-        Self { train_data, val_data, vocab_size, token_to_idx, idx_to_token: vocab, mode: TokenMode::Word }
+        Self { train_data, val_data, vocab_size, token_to_idx, idx_to_token: vocab, mode: TokenMode::Word, bpe: None }
+    }
+
+    /// BPE tokenizer: load vocabulary from tokenizer.json, encode data with BPE.
+    pub fn from_file_bpe(data_path: &str, tokenizer_path: &str, train_frac: f32) -> Self {
+        let text = fs::read_to_string(data_path).expect("Failed to read training data");
+        let bpe = BpeTokenizer::from_file(tokenizer_path);
+
+        let vocab_size = bpe.vocab_size;
+        let data = bpe.encode(&text);
+
+        let split = (data.len() as f32 * train_frac) as usize;
+        let train_data = data[..split].to_vec();
+        let val_data = data[split..].to_vec();
+
+        println!("  Dataset [bpe]: {} tokens (train={}, val={}), vocab_size={}",
+            data.len(), train_data.len(), val_data.len(), vocab_size);
+
+        // token_to_idx/idx_to_token not used for BPE encode/decode, but kept for compatibility
+        Self {
+            train_data, val_data, vocab_size,
+            token_to_idx: HashMap::new(),
+            idx_to_token: Vec::new(),
+            mode: TokenMode::Bpe,
+            bpe: Some(bpe),
+        }
     }
 
     /// Decode token indices back to text.
@@ -122,6 +150,9 @@ impl Dataset {
                     })
                     .collect::<Vec<_>>()
                     .join(" ")
+            }
+            TokenMode::Bpe => {
+                self.bpe.as_ref().expect("BPE tokenizer missing").decode(tokens)
             }
         }
     }

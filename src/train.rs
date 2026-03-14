@@ -77,6 +77,7 @@ pub struct TrainConfig {
     pub lr: f32,
     pub use_curriculum: bool,
     pub word_level: bool,
+    pub bpe_path: Option<String>,
     pub resume_path: Option<String>,
     pub checkpoint_every: usize,
     pub model_seed: u64,
@@ -95,7 +96,9 @@ pub fn train_with_config(config: TrainConfig) {
 
     // Load dataset
     println!("Loading dataset from {}...", config.data_path);
-    let dataset = if config.word_level {
+    let dataset = if let Some(ref bpe_path) = config.bpe_path {
+        Dataset::from_file_bpe(&config.data_path, bpe_path, 0.9)
+    } else if config.word_level {
         Dataset::from_file_words(&config.data_path, 0.9, 3)
     } else {
         Dataset::from_file(&config.data_path)
@@ -301,7 +304,7 @@ fn write_summary(
         Err(e) => { println!("  [summary write failed: {e}]"); return; }
     };
 
-    let mode = if config.word_level { "word" } else { "char" };
+    let mode = if config.bpe_path.is_some() { "bpe" } else if config.word_level { "word" } else { "char" };
     let final_train = loss_history.last().map(|(_, l)| *l).unwrap_or(0.0);
     let final_val = val_history.last().map(|(_, l)| *l).unwrap_or(0.0);
 
