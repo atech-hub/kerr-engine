@@ -148,9 +148,9 @@ Every gradient is hand-derived and verified against PyTorch's automatic differen
 
 | Metric | Value |
 |---|---|
-| GPU utilisation | 38% at 49°C |
+| GPU utilisation | 16% (dispatch overhead dominated) |
 | VRAM used | 1.2 / 12.0 GB |
-| Iteration time | 1.72s (down from 13s before forward batching) |
+| Iteration time | 1.72s (measured, 20-iter avg, down from 13s before batching) |
 | Loss trajectory | 4.28 → 3.07 (50 iters) — correct convergence |
 | Attention backward (GPU) | 4 ms |
 | c_attn weight gradient | 14 ms (28x faster than per-position dispatch) |
@@ -163,7 +163,7 @@ Every gradient is hand-derived and verified against PyTorch's automatic differen
 | c_proj backward | ~200 ms | ~7 ms | 28x |
 | c_attn backward | ~400 ms | ~14 ms | 28x |
 | Attention backward | CPU ~400 ms (est.) | GPU 4 ms | ~100x |
-| FFN backward | ~340 ms | ~277 ms | 1.2x |
+| FFN backward | ~340 ms | ~61 ms | 5.6x |
 | Total backward pass | ~4.4 s | ~968 ms | 4.5x |
 
 **Forward pass batching impact (768-dim):**
@@ -174,7 +174,7 @@ Every gradient is hand-derived and verified against PyTorch's automatic differen
 | QKV + output projections | ~1,465 ms | ~50 ms (est.) | ~30x |
 | Layer norms | ~418 ms | ~30 ms (est.) | ~14x |
 | Total forward pass | ~8,060 ms | ~500 ms | **16x** |
-| **Total iteration** | **~13 s** | **1.72 s** | **7.6x** |
+| **Total iteration** | **~13 s** | **1.72 s** (measured, 20-iter avg) | **7.6x** |
 
 **Optimisation history (128-dim, 200 iters):**
 
@@ -221,7 +221,7 @@ The engine includes a WGPU compute shader backend that runs on any GPU — NVIDI
 
 **Three tiers:**
 - **CPU** — Used automatically below 768-dim. Fastest at small scale due to zero dispatch overhead.
-- **Full GPU** — Forward and backward on GPU. Attention backward via two-dispatch shader (4ms at 768-dim). Batched linear backward (28x speedup). Weight gradient accumulation via outer product shader. Auto-selects at 768+ dim.
+- **Full GPU** — Forward and backward on GPU. All operations batched across positions. Attention backward via two-dispatch shader (4ms at 768-dim). Batched linear backward (28x speedup). Batched Kerr-ODE backward (5.6x speedup). Weight gradient accumulation via outer product shader. Auto-selects at 768+ dim. Remaining bottleneck: CPU dispatch overhead (16% GPU utilisation). Unified memory architectures (Apple Silicon) eliminate this.
 - **FFN backward** — Kerr-ODE and maestro backward remain per-position on CPU. Identified bottleneck for community optimisation.
 
 **Benchmarked at 128-dim (RTX 4070 Ti):**
@@ -256,6 +256,7 @@ At 128-dim, CPU wins. The GPU persistent pipeline eliminates 99.7% of dispatch o
 | `matvec_batch.wgsl` | Batched forward linear: all positions in one dispatch |
 | `layer_norm_batch.wgsl` | Batched forward layer norm: all positions in one dispatch |
 | `kerr_step_batch.wgsl` | Batched Kerr-ODE derivative: all positions in one dispatch |
+| `kerr_backward_batch.wgsl` | Batched Kerr-ODE derivative backward: all positions in one dispatch |
 
 ---
 
@@ -313,7 +314,7 @@ kerr-engine/
 └── LICENSE              Apache 2.0
 ```
 
-~7,100 lines of Rust. 19 modules. 16 compute shaders. 4 dependencies.
+~7,300 lines of Rust. 19 modules. 17 compute shaders. 4 dependencies.
 
 ---
 
@@ -344,9 +345,8 @@ What this means for contributions:
 - **The maintainer merges based on validation results and description, not code review.** Be clear about what you changed and why.
 
 **Known optimisation targets for contributors:**
-- Backward Kerr-ODE batching (same pattern as forward — ~250ms/block × 3 = 750ms, largest remaining bottleneck)
+- Persistent buffer pool for GPU dispatches (320 backward dispatches each create ~13 buffers — GPU at 16% utilisation because CPU dispatch overhead dominates. Reusing buffers would eliminate the bottleneck. The gpu_persistent.rs pattern already solves this for inference — extending it to training is the biggest remaining win)
 - Fused attention forward shader (head loop is 28ms, minor but could eliminate last CPU component)
-- Kerr-ODE backward GPU shader (revisit at ~1,500+ bands — currently 6ms/block on CPU, not worth dispatch overhead)
 - SIMD inner loops (viable at 512+ dim, not at 128-dim)
 
 Every gradient is mathematically verified. Every validation gate passes independently. The code is the code — it either works or it doesn't.
