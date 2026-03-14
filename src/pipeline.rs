@@ -370,12 +370,13 @@ impl ModelWeights {
             let mut d_h1 = d_hidden.clone();
 
             let _t_ffn = std::time::Instant::now();
-            // Backward through FFN
-            for pos in 0..t {
-                let d_normed_2 = match (&block.ffn, &mut bg.ffn) {
-                    (FfnWeights::PerBand(w), FfnGrads::PerBand {
-                        band_w, band_b, out_proj_w, out_proj_b
-                    }) => {
+            // Backward through FFN — batched across all positions
+            let d_normed_2_all: Vec<Vec<f32>> = match (&block.ffn, &mut bg.ffn) {
+                (FfnWeights::PerBand(w), FfnGrads::PerBand {
+                    band_w, band_b, out_proj_w, out_proj_b
+                }) => {
+                    // Forward recompute per-band transform for all positions
+                    let bands_out_all: Vec<Vec<f32>> = (0..t).map(|pos| {
                         let mut bands_out = vec![0.0f32; n_embd];
                         for band in 0..n_bands {
                             let r_in = bc.normed_2[pos][band * 2];
@@ -385,87 +386,119 @@ impl ModelWeights {
                             bands_out[band * 2] = bw[0][0] * r_in + bw[1][0] * s_in + bb[0];
                             bands_out[band * 2 + 1] = bw[0][1] * r_in + bw[1][1] * s_in + bb[1];
                         }
-
-                        let d_bands_out = backend.linear_backward_dx(&d_ffn_out[pos], &w.out_proj.w);
-                        // d_w[i][j] = d_y[i] * x[j], d_b[i] = d_y[i]
-                        for i in 0..n_embd {
-                            let dy_i = d_ffn_out[pos][i];
-                            for j in 0..n_embd { out_proj_w[i][j] += dy_i * bands_out[j]; }
-                            out_proj_b[i] += dy_i;
-                        }
-
+                        bands_out
+                    }).collect();
+                    // Batched out_proj backward: all positions in one dispatch
+                    let d_bands_out_all = backend.linear_backward_dx_batch(&d_ffn_out, &w.out_proj.w);
+                    let (op_dw, op_db) = backend.outer_product_accum(&d_ffn_out, &bands_out_all, true);
+                    for i in 0..n_embd {
+                        for j in 0..n_embd { out_proj_w[i][j] += op_dw[i][j]; }
+                        out_proj_b[i] += op_db[i];
+                    }
+                    // Per-band backward (trivial per-band math, not worth GPU)
+                    (0..t).map(|pos| {
                         let mut d_input = vec![0.0f32; n_embd];
                         for band in 0..n_bands {
-                            let d_out_r = d_bands_out[band * 2];
-                            let d_out_s = d_bands_out[band * 2 + 1];
+                            let d_out_r = d_bands_out_all[pos][band * 2];
+                            let d_out_s = d_bands_out_all[pos][band * 2 + 1];
                             let r_in = bc.normed_2[pos][band * 2];
                             let s_in = bc.normed_2[pos][band * 2 + 1];
-
                             band_w[band][0][0] += d_out_r * r_in;
                             band_w[band][0][1] += d_out_s * r_in;
                             band_w[band][1][0] += d_out_r * s_in;
                             band_w[band][1][1] += d_out_s * s_in;
                             band_b[band][0] += d_out_r;
                             band_b[band][1] += d_out_s;
-
                             d_input[band * 2] += w.band_w[band][0][0] * d_out_r
                                                + w.band_w[band][0][1] * d_out_s;
                             d_input[band * 2 + 1] += w.band_w[band][1][0] * d_out_r
                                                    + w.band_w[band][1][1] * d_out_s;
                         }
                         d_input
-                    }
-                    (FfnWeights::KerrMaestro(w), FfnGrads::KerrMaestro {
-                        gamma_raw, omega, alpha, beta,
-                        squeeze_w, squeeze_b, process_w, process_b,
-                        out_proj_w, out_proj_b,
-                    }) => {
+                    }).collect()
+                }
+                (FfnWeights::KerrMaestro(w), FfnGrads::KerrMaestro {
+                    gamma_raw, omega, alpha, beta,
+                    squeeze_w, squeeze_b, process_w, process_b,
+                    out_proj_w, out_proj_b,
+                }) => {
+                    // Phase 1: Forward recompute all positions
+                    let combined_all: Vec<Vec<f32>> = (0..t).map(|pos| {
                         let kerr_out = self.kerr_ode_forward(&w.kerr, &bc.normed_2[pos]);
                         let maestro_out = self.maestro_forward(&w.maestro, &bc.normed_2[pos]);
                         let mut combined = vec![0.0f32; n_embd];
                         for i in 0..n_embd { combined[i] = kerr_out[i] + maestro_out[i]; }
-
-                        let d_combined = backend.linear_backward_dx(&d_ffn_out[pos], &w.out_proj.w);
-                        for i in 0..n_embd {
-                            let dy_i = d_ffn_out[pos][i];
-                            for j in 0..n_embd { out_proj_w[i][j] += dy_i * combined[j]; }
-                            out_proj_b[i] += dy_i;
-                        }
-
-                        let d_kerr = &d_combined;
-                        let d_maestro = &d_combined;
-
+                        combined
+                    }).collect();
+                    // Phase 2: Batched out_proj backward
+                    let d_combined_all = backend.linear_backward_dx_batch(&d_ffn_out, &w.out_proj.w);
+                    let (op_dw, op_db) = backend.outer_product_accum(&d_ffn_out, &combined_all, true);
+                    for i in 0..n_embd {
+                        for j in 0..n_embd { out_proj_w[i][j] += op_dw[i][j]; }
+                        out_proj_b[i] += op_db[i];
+                    }
+                    // Phase 3: Kerr-ODE backward per position (accumulate shared grads)
+                    let mut d_input_all = vec![vec![0.0f32; n_embd]; t];
+                    for pos in 0..t {
                         let (d_kerr_input, d_gr, d_om, d_al, d_be) =
-                            kerr_ode_backward(d_kerr, &bc.normed_2[pos], &w.kerr);
+                            kerr_ode_backward(&d_combined_all[pos], &bc.normed_2[pos], &w.kerr);
                         for k in 0..n_bands {
                             gamma_raw[k] += d_gr[k];
                             omega[k] += d_om[k];
                         }
                         *alpha += d_al;
                         *beta += d_be;
-
-                        let (d_maestro_input, d_sq, d_pr) =
-                            maestro_backward(d_maestro, &bc.normed_2[pos], &w.maestro);
-                        for i in 0..maestro_dim {
-                            for j in 0..n_embd { squeeze_w[i][j] += d_sq.d_w[i][j]; }
-                            squeeze_b[i] += d_sq.d_b[i];
-                        }
-                        for i in 0..n_embd {
-                            for j in 0..maestro_dim { process_w[i][j] += d_pr.d_w[i][j]; }
-                            process_b[i] += d_pr.d_b[i];
-                        }
-
-                        let mut d_input = vec![0.0f32; n_embd];
-                        for i in 0..n_embd {
-                            d_input[i] = d_kerr_input[i] + d_maestro_input[i];
-                        }
-                        d_input
+                        for i in 0..n_embd { d_input_all[pos][i] += d_kerr_input[i]; }
                     }
-                    _ => unreachable!(),
-                };
+                    // Phase 4: Batched maestro backward
+                    // Forward recompute squeeze + GELU for all positions
+                    let squeezed_all: Vec<Vec<f32>> = (0..t).map(|pos| {
+                        linear_fn(&w.maestro.squeeze.w, &w.maestro.squeeze.b, &bc.normed_2[pos])
+                    }).collect();
+                    let activated_all: Vec<Vec<f32>> = squeezed_all.iter().map(|sq| {
+                        sq.iter().map(|&v| crate::model::gelu(v)).collect()
+                    }).collect();
+                    // Backward through process linear (batched)
+                    let d_activated_all = backend.linear_backward_dx_batch(
+                        &d_combined_all, &w.maestro.process_1.w,
+                    );
+                    let (pr_dw, pr_db) = backend.outer_product_accum(
+                        &d_combined_all, &activated_all, true,
+                    );
+                    for i in 0..n_embd {
+                        for j in 0..maestro_dim { process_w[i][j] += pr_dw[i][j]; }
+                        process_b[i] += pr_db[i];
+                    }
+                    // GELU backward per position (maestro_dim elements, trivial)
+                    let d_squeezed_all: Vec<Vec<f32>> = (0..t).map(|pos| {
+                        backend.gelu_backward(&d_activated_all[pos], &squeezed_all[pos])
+                    }).collect();
+                    // Backward through squeeze linear (batched)
+                    let d_maestro_inputs = backend.linear_backward_dx_batch(
+                        &d_squeezed_all, &w.maestro.squeeze.w,
+                    );
+                    let (sq_dw, sq_db) = backend.outer_product_accum(
+                        &d_squeezed_all, &bc.normed_2, true,
+                    );
+                    for i in 0..maestro_dim {
+                        for j in 0..n_embd { squeeze_w[i][j] += sq_dw[i][j]; }
+                        squeeze_b[i] += sq_db[i];
+                    }
+                    // Combine kerr + maestro input grads
+                    for pos in 0..t {
+                        for i in 0..n_embd {
+                            d_input_all[pos][i] += d_maestro_inputs[pos][i];
+                        }
+                    }
+                    d_input_all
+                }
+                _ => unreachable!(),
+            };
 
+            // Layer norm backward for all positions
+            for pos in 0..t {
                 let (d_h1_from_ln2, d_w, d_b) = backend.layer_norm_backward(
-                    &d_normed_2, &bc.h1[pos], &block.ln_2.weight,
+                    &d_normed_2_all[pos], &bc.h1[pos], &block.ln_2.weight,
                 );
                 for i in 0..n_embd {
                     bg.ln_2_weight[i] += d_w[i];

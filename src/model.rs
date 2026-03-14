@@ -72,7 +72,7 @@ fn softplus(x: f32) -> f32 {
 }
 
 /// GELU activation (approximate version matching PyTorch default)
-fn gelu(x: f32) -> f32 {
+pub fn gelu(x: f32) -> f32 {
     0.5 * x * (1.0 + ((2.0 / PI).sqrt() * (x + 0.044715 * x * x * x)).tanh())
 }
 
