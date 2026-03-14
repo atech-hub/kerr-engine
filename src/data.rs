@@ -160,7 +160,7 @@ impl Dataset {
 // ─── Word tokenizer ──────────────────────────────────────────
 
 /// Split text into word tokens: lowercase words + separate punctuation.
-fn tokenize_words(text: &str) -> Vec<String> {
+pub fn tokenize_words(text: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     for line in text.lines() {
         for chunk in line.split_whitespace() {
@@ -197,7 +197,7 @@ fn tokenize_words(text: &str) -> Vec<String> {
     tokens
 }
 
-fn is_punct(b: u8) -> bool {
+pub fn is_punct(b: u8) -> bool {
     matches!(b, b'.' | b',' | b';' | b':' | b'!' | b'?' | b'\'' | b'"'
              | b'(' | b')' | b'[' | b']' | b'-' | b'&')
 }
