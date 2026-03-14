@@ -44,8 +44,8 @@ This repo: public (Apache 2.0). Released 2026-03-13.
 | Module | Lines | Role |
 |---|---|---|
 | `gpu_backend.rs` | 10 | Thin re-export module. Imports and re-exports from gpu_pipelines, gpu_dispatch, gpu_validate. Backward-compatible — no other module needs to change imports. |
-| `gpu_pipelines.rs` | 755 | `GpuBackend` struct, all 11 shader pipeline compilations (6 forward, 5 backward), param structs, constructors (`new()`, `with_device_index()`), dispatch helpers, GPU adapter enumeration (`list_gpus`). |
-| `gpu_dispatch.rs` | 483 | `impl ComputeBackend for GpuBackend`. All forward + backward trait method dispatches. Per-call pattern: ~500μs dispatch overhead per operation; batched methods amortise this across positions. The file to edit for new GPU operations. |
+| `gpu_pipelines.rs` | 1060 | `GpuBackend` struct, all 14 shader pipeline compilations (9 forward, 5 backward), param structs, constructors (`new()`, `with_device_index()`), dispatch helpers (incl. batched: gpu_matvec_batch, gpu_layer_norm_batch, gpu_kerr_derivative_batch, gpu_kerr_ode_batch), GPU adapter enumeration (`list_gpus`). |
+| `gpu_dispatch.rs` | 529 | `impl ComputeBackend for GpuBackend`. All forward + backward trait method dispatches. Overrides linear_batch, linear_no_bias_batch, layer_norm_batch for batched GPU dispatch. Batched kerr_maestro_add and per_band_linear. The file to edit for new GPU operations. |
 | `gpu_validate.rs` | 271 | GPU validation harness (all primitives vs CPU) + per-primitive benchmark. Isolated from hot path — changes here never affect training. |
 | `gpu_persistent.rs` | 720 | `GpuPersistent` — persistent buffer pipeline. Weights uploaded once, scratch buffers pre-allocated, single command encoder submit, single readback. Fused RK4 Kerr-ODE (8 dispatches vs 32). Benchmark: 296x faster than per-call GPU. Still 11-18x slower than CPU at 128-dim. Crossover: ~700-800 dim. |
 | `pipeline.rs` | 581 | Cached forward pass routing through `ComputeBackend`. Full backward chain: all operations batched across positions through trait. FFN backward: out_proj via batched linear_backward_dx_batch + outer_product_accum, maestro via batched linears + GELU, Kerr-ODE backward per-position (CPU analytical). Timing instrumentation (TIMING const, disabled by default). Cache structs (ForwardCache, BlockCache, AttnCache). GradAccum struct. |
@@ -63,9 +63,9 @@ This repo: public (Apache 2.0). Released 2026-03-13.
 | `init.rs` | 110 | Weight initialization from scratch. Matches PyTorch defaults (uniform ±1/√fan_in). Kerr params: γ_raw=softplus⁻¹(0.1), ω=k/N linearly spaced, α=β=0.1. |
 | `rng.rs` | 45 | Deterministic xorshift64 PRNG. Seeded, reproducible. state()/from_state() for checkpointing. |
 
-**Total: ~6,550 lines across 19 modules.**
+**Total: ~7,100 lines across 19 modules.**
 
-**Shaders (11 WGSL compute shaders):**
+**Shaders (16 WGSL compute shaders):**
 | File | Role |
 |---|---|
 | `shaders/matvec.wgsl` | Matrix-vector multiply: y = W @ x + b. One thread per output row, workgroup size 64. Uniform flag for bias/no-bias. |
@@ -81,6 +81,9 @@ This repo: public (Apache 2.0). Released 2026-03-13.
 | `shaders/attn_backward_scores.wgsl` | Attention backward Phase 1: d_score (softmax backward) + d_q. One workgroup per (pos, head). Shared memory reduction for softmax Jacobian. |
 | `shaders/attn_backward_dkv.wgsl` | Attention backward Phase 2: d_k + d_v from d_score. One thread per (ki, d_global). No race conditions — each thread writes unique element. |
 | `shaders/outer_product.wgsl` | Batched outer product: d_w[i][j] = sum_pos d_y[pos][i] * x[pos][j]. One workgroup per row. Also computes d_b. Replaces CPU weight gradient accumulation. |
+| `shaders/matvec_batch.wgsl` | Batched forward linear: y[pos] = W @ x[pos] + b for all positions. One thread per (pos, out_dim). use_bias flag. Replaces N separate matvec dispatches. QKV: 260ms→23ms (11x). |
+| `shaders/layer_norm_batch.wgsl` | Batched forward layer norm: one workgroup (256 threads) per position. Strided reduction for mean/variance. LN1+LN2: 118ms→3ms (39x). |
+| `shaders/kerr_step_batch.wgsl` | Batched Kerr-ODE derivative: all positions in one dispatch. One thread per (pos, band). Shared gamma/omega/alpha/beta. 2,048 dispatches/block→32. FFN: 2,020ms→84ms (24x). |
 
 ---
 
@@ -163,6 +166,21 @@ If numbers drift on either baseline, the refactor broke something.
 
 **~2.6x faster on CPU only after optimisation (was 2.1x before mimalloc + iterators + clone elimination).** Same convergence, same final loss. Framework overhead (Python interpreter, autograd tape, CUDA kernel launch, tensor metadata) exceeds the GPU compute advantage at this scale. Total optimisation: 20% over unoptimised Rust baseline (15.3s → 12.2s for 200 iters). All gains bit-identical.
 
+## Training benchmark: 768-dim (12M params)
+
+**Config:** batch=4, seq=64, lr=3e-4, no curriculum, Shakespeare, 384 bands, 4 threads.
+
+| Metric | Value |
+|---|---|
+| Iteration time | 1.72s |
+| GPU utilisation | 38% at 49°C |
+| VRAM | 1.2 / 12.0 GB |
+| Forward pass | ~500ms (down from 8,060ms before batching, 16x) |
+| Backward pass | ~970ms (down from 4,400ms before batching, 4.5x) |
+| Full speedup | 7.6x (13s → 1.72s) |
+
+Competitive with PyTorch at 768-dim. Faster than PyTorch at 128-dim. On a third of the GPU, at half the temperature.
+
 ## GPU benchmark: per-call vs persistent vs CPU (128-dim)
 
 | Pattern | FFN chain | Kerr-ODE | Why |
@@ -203,6 +221,7 @@ Persistent is 296x faster than per-call for Kerr-ODE. CPU still wins at 128-dim.
 | Training summary (JSON) | train.rs | DONE — config + loss curves + timing |
 | GPU backend (forward) | gpu_backend.rs | DONE — 6 forward shaders, all 8 trait methods, validated |
 | GPU backward shaders | gpu_backend.rs + shaders/ | DONE — 5 backward shaders: matvec_backward, matvec_backward_batch, layer_norm_backward, attn_backward (2-dispatch), outer_product, gelu_backward. Attention backward 4ms on GPU. Batched matvec 28x speedup. |
+| Batched forward dispatch | gpu_dispatch.rs + shaders/ | DONE — 3 new shaders: matvec_batch, layer_norm_batch, kerr_step_batch. All forward operations batch positions into single GPU dispatches. Forward pass 8,060ms→516ms (16x). Full iteration 13s→1.72s (7.6x). |
 | ModelConfig refactor | model.rs, pipeline.rs | DONE — runtime-configurable n_bands, n_head, n_layers, maestro_dim, block_size, rk4_steps. All forward ops derive from config/data. |
 | Multi-GPU selection | gpu_backend.rs, main.rs | DONE — `list-gpus` command, `--gpu-device N` flag, `with_device_index(idx)` constructor |
 | generate() GPU routing | train.rs | DONE — inference routes through ComputeBackend via forward_with_cache() |
@@ -229,11 +248,13 @@ Persistent is 296x faster than per-call for Kerr-ODE. CPU still wins at 128-dim.
 | Tier | Implementation | Status |
 |---|---|---|
 | CPU | `CpuBackend` in backend.rs | Operational. All forward + backward methods. Bit-identical baseline validated. |
-| GPU | `GpuBackend` in gpu_backend.rs | Operational. Forward: linear/layer_norm/kerr_ode on GPU. Backward: attention backward (2-dispatch), batched linear_backward_dx, outer_product_accum, layer_norm_backward, gelu_backward all on GPU. FFN backward: out_proj + maestro batched on GPU, Kerr-ODE per-position CPU. Activates at N_EMBD >= 768. |
+| GPU | `GpuBackend` in gpu_backend.rs | Operational. Forward: all operations batched across positions — linear_batch, layer_norm_batch, kerr_ode_batch, per_band_linear, kerr_maestro_add all dispatch once for all positions. Backward: attention backward (2-dispatch), batched linear_backward_dx, outer_product_accum, layer_norm_backward, gelu_backward all on GPU. FFN backward: out_proj + maestro batched on GPU, Kerr-ODE per-position CPU. Activates at N_EMBD >= 768. 16 shaders total (9 forward, 5 backward, 2 attention backward). |
 
 Training pipeline dispatches through `ComputeBackend`. auto_select picks backend at startup based on N_EMBD. Inference routes through backend via `forward_with_cache()`. model.rs forward kept independent as Stage 2 validation reference.
 
-**GPU backward profiling (768-dim, 12M params, RTX 4070 Ti):**
+**GPU profiling (768-dim, 12M params, RTX 4070 Ti):**
+
+Backward pass:
 
 | Operation | Before batching | After batching | Speedup |
 |---|---|---|---|
@@ -243,7 +264,22 @@ Training pipeline dispatches through `ComputeBackend`. auto_select picks backend
 | FFN+LN2 backward | ~340ms | ~277ms (measured) | 1.2x |
 | Total backward | ~4.4s | ~968ms (measured) | 4.5x |
 
-FFN backward restructured: out_proj + maestro linears batched across positions. At 768-dim, Kerr-ODE analytical backward (RK4 forward recompute + 32 derivative evaluations × 64 positions) is now the dominant cost at ~250ms/block. The batched linears saved ~63ms/block (~18%). Further improvement requires restructuring the Kerr-ODE backward itself (Tier 2+).
+Forward pass:
+
+| Operation | Before batching | After batching | Speedup |
+|---|---|---|---|
+| LN1 (per block) | 55ms | 1.4ms | 39x |
+| QKV projection | 260ms | 23ms | 11x |
+| Out projection | 107ms | 8ms | 13x |
+| Residual+LN2 | 63ms | 1.7ms | 37x |
+| FFN KerrMaestro | 2,020ms | 84ms | 24x |
+| FFN PerBand | 104ms | 8ms | 13x |
+| Total forward (4 blocks) | ~8,060ms | ~516ms | 16x |
+| **Full iteration** | **~13s** | **1.72s** | **7.6x** |
+
+Forward bottleneck was per-position GPU dispatch overhead: 2,048 dispatches per Kerr block (64 positions × 32 RK4 derivative evals). Three new batched shaders reduced this to 32 dispatches per block. Remaining forward time dominated by attention head loop (28ms, CPU — trivial).
+
+Backward remaining bottleneck: Kerr-ODE analytical backward (RK4 forward recompute + 32 derivative evaluations × 64 positions) at ~250ms/block. Same batching pattern applicable but separate session.
 
 **Module growth targets:** Keep files under ~550 lines. Current largest: gpu_pipelines.rs (755) — contains 11 shader compilations, stable.
 

@@ -148,8 +148,9 @@ Every gradient is hand-derived and verified against PyTorch's automatic differen
 
 | Metric | Value |
 |---|---|
-| GPU utilisation | 35-37% at 46°C |
-| VRAM used | 1.0-1.1 / 12.0 GB |
+| GPU utilisation | 38% at 49°C |
+| VRAM used | 1.2 / 12.0 GB |
+| Iteration time | 1.72s (down from 13s before forward batching) |
 | Loss trajectory | 4.28 → 3.07 (50 iters) — correct convergence |
 | Attention backward (GPU) | 4 ms |
 | c_attn weight gradient | 14 ms (28x faster than per-position dispatch) |
@@ -164,6 +165,16 @@ Every gradient is hand-derived and verified against PyTorch's automatic differen
 | Attention backward | CPU ~400 ms (est.) | GPU 4 ms | ~100x |
 | FFN backward | ~340 ms | ~277 ms | 1.2x |
 | Total backward pass | ~4.4 s | ~968 ms | 4.5x |
+
+**Forward pass batching impact (768-dim):**
+
+| Component | Before batching | After batching | Speedup |
+|---|---|---|---|
+| Kerr-ODE forward (3 blocks) | ~6,060 ms | ~150 ms (est.) | ~40x |
+| QKV + output projections | ~1,465 ms | ~50 ms (est.) | ~30x |
+| Layer norms | ~418 ms | ~30 ms (est.) | ~14x |
+| Total forward pass | ~8,060 ms | ~500 ms | **16x** |
+| **Total iteration** | **~13 s** | **1.72 s** | **7.6x** |
 
 **Optimisation history (128-dim, 200 iters):**
 
@@ -242,6 +253,9 @@ At 128-dim, CPU wins. The GPU persistent pipeline eliminates 99.7% of dispatch o
 | `attn_backward_scores.wgsl` | Attention backward Phase 1: softmax backward + d_q |
 | `attn_backward_dkv.wgsl` | Attention backward Phase 2: d_k + d_v |
 | `outer_product.wgsl` | Batched weight gradient accumulation (d_W = D_Y^T @ X) |
+| `matvec_batch.wgsl` | Batched forward linear: all positions in one dispatch |
+| `layer_norm_batch.wgsl` | Batched forward layer norm: all positions in one dispatch |
+| `kerr_step_batch.wgsl` | Batched Kerr-ODE derivative: all positions in one dispatch |
 
 ---
 
@@ -299,7 +313,7 @@ kerr-engine/
 └── LICENSE              Apache 2.0
 ```
 
-~6,550 lines of Rust. 19 modules. 13 compute shaders. 4 dependencies.
+~7,100 lines of Rust. 19 modules. 16 compute shaders. 4 dependencies.
 
 ---
 
@@ -330,9 +344,8 @@ What this means for contributions:
 - **The maintainer merges based on validation results and description, not code review.** Be clear about what you changed and why.
 
 **Known optimisation targets for contributors:**
-- Attention forward: fused GPU shader (currently CPU triple-nested loop — biggest remaining bottleneck at 768-dim)
-- Attention forward: thread across heads via thread::scope (quick win, 12 heads are independent)
-- Forward pass batched dispatch (same per-position overhead pattern as backward had)
+- Backward Kerr-ODE batching (same pattern as forward — ~250ms/block × 3 = 750ms, largest remaining bottleneck)
+- Fused attention forward shader (head loop is 28ms, minor but could eliminate last CPU component)
 - Kerr-ODE backward GPU shader (revisit at ~1,500+ bands — currently 6ms/block on CPU, not worth dispatch overhead)
 - SIMD inner loops (viable at 512+ dim, not at 128-dim)
 
