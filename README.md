@@ -31,11 +31,20 @@ This engine implements the full training pipeline in Rust with hand-derived anal
 # Build
 cargo build --release
 
+# See all commands
+cargo run --release -- --help
+
 # Train on Shakespeare (default settings)
 cargo run --release -- train data/input.txt
 
+# See all training options
+cargo run --release -- train --help
+
 # Train with explicit configuration
 cargo run --release -- train data/input.txt 3000 4 64 3e-4 --seed 42
+
+# Train with BPE tokenizer (real language models)
+cargo run --release -- train data/corpus.txt 3000 --bpe tokenizer.json
 ```
 
 The engine auto-detects your hardware and selects the optimal backend. At 128-dim (the current model), CPU is faster. At 768+ dim, it automatically switches to GPU via WGPU — no CUDA required, works on NVIDIA, AMD, Intel, and Apple Silicon.
@@ -83,7 +92,14 @@ kerr-engine train [data] [iters] [batch] [seq] [lr] [flags]
 | `--gpu` | auto | Force GPU backend (falls back to CPU if unavailable) |
 | `--no-curriculum` | curriculum on | Disable progressive band curriculum |
 | `--word` | character-level | Use word-level tokenizer |
+| `--bpe FILE` | none | Use BPE tokenizer from HuggingFace tokenizer.json (Qwen, Llama, GPT-2) |
 | `--resume FILE` | fresh init | Resume from checkpoint (handles vocab resize for cross-corpus training) |
+| `--n-bands N` | 64 | Harmonic frequency bands |
+| `--n-head N` | 4 | Attention heads |
+| `--n-layers N` | 4 | Transformer blocks |
+| `--maestro-dim N` | 16 | Maestro bottleneck width |
+| `--block-size N` | 256 | Max sequence length |
+| `--rk4-steps N` | 8 | ODE integration steps per layer |
 
 ### Examples
 
@@ -103,9 +119,15 @@ cargo run --release -- train data/input.txt 6000 4 64 3e-4 --seed 42 --resume ch
 
 # Word-level tokenization
 cargo run --release -- train data/input.txt 3000 4 64 3e-4 --word
+
+# BPE tokenizer (download any HuggingFace tokenizer.json)
+cargo run --release -- train data/corpus.txt 10000 --bpe tokenizer.json
+
+# Larger model (768-dim)
+cargo run --release -- train data/input.txt 3000 --n-bands 384 --n-head 12 --gpu
 ```
 
-Nothing is hardcoded. Every training parameter is a CLI switch with a sensible default.
+Nothing is hardcoded. Every training parameter is a CLI switch with a sensible default. Run `kerr-engine train --help` for full details.
 
 ---
 
@@ -148,7 +170,7 @@ Every gradient is hand-derived and verified against PyTorch's automatic differen
 
 | Metric | Value |
 |---|---|
-| GPU utilisation | 16% (dispatch overhead dominated) |
+| GPU utilisation | 16% at 49°C (dispatch overhead dominated) |
 | VRAM used | 1.2 / 12.0 GB |
 | Iteration time | 1.72s (measured, 20-iter avg, down from 13s before batching) |
 | Loss trajectory | 4.28 → 3.07 (50 iters) — correct convergence |
@@ -219,10 +241,9 @@ Integration: 8 RK4 steps per layer at dt=0.125.
 
 The engine includes a WGPU compute shader backend that runs on any GPU — NVIDIA, AMD, Intel, Apple Silicon. No CUDA dependency.
 
-**Three tiers:**
+**Two tiers:**
 - **CPU** — Used automatically below 768-dim. Fastest at small scale due to zero dispatch overhead.
-- **Full GPU** — Forward and backward on GPU. All operations batched across positions. Attention backward via two-dispatch shader (4ms at 768-dim). Batched linear backward (28x speedup). Batched Kerr-ODE backward (5.6x speedup). Weight gradient accumulation via outer product shader. Auto-selects at 768+ dim. Remaining bottleneck: CPU dispatch overhead (16% GPU utilisation). Unified memory architectures (Apple Silicon) eliminate this.
-- **FFN backward** — Kerr-ODE and maestro backward remain per-position on CPU. Identified bottleneck for community optimisation.
+- **Full GPU** — Forward and backward on GPU. All operations batched across positions. Attention backward via two-dispatch shader (4ms at 768-dim). Batched linear backward (28x speedup). Batched Kerr-ODE forward and backward. Weight gradient accumulation via outer product shader. Auto-selects at 768+ dim. Remaining bottleneck: CPU dispatch overhead (16% GPU utilisation at 768-dim). Unified memory architectures (Apple Silicon) would eliminate this entirely.
 
 **Benchmarked at 128-dim (RTX 4070 Ti):**
 
@@ -264,22 +285,21 @@ At 128-dim, CPU wins. The GPU persistent pipeline eliminates 99.7% of dispatch o
 
 The Kerr-ODE is a novel architecture — it is NOT a standard transformer and does NOT work with existing inference clients out of the box.
 
-**What won't work today:**
-- LM Studio, Ollama, llama.cpp — these expect dense MLP feed-forward layers. The Kerr-ODE uses RK4 integration with neighbour coupling, which no existing runtime supports.
-- Hugging Face Transformers — no Kerr-ODE model class exists in the library.
-- GGUF/GGML export — the format has no representation for ODE integration steps or stencil coupling.
-
 **What works today:**
-- The engine itself. Train a model, generate text, checkpoint and resume — all within the engine's CLI. The `generate()` function runs autoregressive inference through the same `ComputeBackend` used for training.
+- **Train and generate** within the engine's CLI — `kerr-engine train` and the built-in `generate()` function
+- **Serve via [Kerr Server](https://github.com/atech-hub/kerr-server)** — OpenAI-compatible API server (640 lines Rust, SSE streaming, bearer token auth). Any chat UI that speaks the OpenAI protocol connects without modification. Verified with LM Studio 0.4.6.
+- **BPE tokenizer support** — load any HuggingFace `tokenizer.json` (Qwen, Llama, GPT-2) via `--bpe` flag
 
-**What's needed for ecosystem integration:**
-- An OpenAI-compatible API server wrapping the engine (simplest path — any chat UI that speaks the OpenAI API could connect)
+**What won't work natively:**
+- LM Studio, Ollama, llama.cpp — these expect dense MLP feed-forward layers. The Kerr-ODE uses RK4 integration with neighbour coupling, which no existing runtime supports natively. Use the [Kerr Server](https://github.com/atech-hub/kerr-server) as the bridge.
+- Hugging Face Transformers — no Kerr-ODE model class exists in the library
+- GGUF/GGML export — the format has no representation for ODE integration steps or stencil coupling
+
+**What's needed for deeper ecosystem integration:**
 - A GGUF exporter with custom Kerr-ODE operators and a corresponding llama.cpp fork
 - A Hugging Face model class implementing the Kerr-ODE forward pass
 
 These are documented as defensive publications in the parent project's [ENGINE-PATTERNS.md](https://github.com/atech-hub/Wave-Coherence-as-a-Computational-Primitive/blob/main/ENGINE-PATTERNS.md) (Pattern 68) to prevent patent enclosure. Anyone can build them.
-
-If you're interested in building a connector, the engine's `model.rs` forward pass and `generate()` function in `train.rs` are the reference implementations.
 
 ---
 
@@ -304,6 +324,8 @@ kerr-engine/
 │   ├── data.rs          Dataset, char/word tokenizers
 │   ├── init.rs          Weight initialisation
 │   ├── checkpoint.rs    Binary checkpoint save/load (bit-perfect resume)
+│   ├── bpe.rs           BPE tokenizer (HuggingFace tokenizer.json)
+│   ├── lib.rs           Library interface for external crates
 │   ├── weights.rs       Python weight loader (for validation)
 │   ├── grad_test.rs     Gradient validation harness
 │   └── rng.rs           Deterministic xorshift64 PRNG
@@ -314,7 +336,7 @@ kerr-engine/
 └── LICENSE              Apache 2.0
 ```
 
-~7,300 lines of Rust. 19 modules. 17 compute shaders. 4 dependencies.
+~7,500 lines of Rust. 21 modules. 17 compute shaders. 4 dependencies.
 
 ---
 
@@ -362,6 +384,7 @@ Every gradient is mathematically verified. Every validation gate passes independ
 ## Related
 
 - [Wave Coherence as a Computational Primitive](https://github.com/atech-hub/Wave-Coherence-as-a-Computational-Primitive) — The parent research project (public, MIT license)
+- [Kerr Server](https://github.com/atech-hub/kerr-server) — OpenAI-compatible inference server for this engine (public, Apache 2.0)
 - DOI: [10.5281/zenodo.18607190](https://doi.org/10.5281/zenodo.18607190) (concept DOI — always resolves to latest version)
 
 ---

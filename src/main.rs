@@ -30,36 +30,63 @@ mod weights;
 use std::env;
 
 fn main() {
-    println!("kerr-engine v0.1.0\n");
-
     let args: Vec<String> = env::args().collect();
+
+    // Top-level help: no args, --help, or -h
+    match args.get(1).map(|s| s.as_str()) {
+        None | Some("--help") | Some("-h") | Some("help") => {
+            print_main_help();
+            return;
+        }
+        _ => {}
+    }
+
+    println!("kerr-engine v0.2.0\n");
 
     match args.get(1).map(|s| s.as_str()) {
         Some("validate") => {
-            // Stage 2: validate full forward pass against Python reference
+            if has_help_flag(&args[2..]) {
+                print_validate_help();
+                return;
+            }
             let weights_path = args.get(2).map(|s| s.as_str()).unwrap_or("model.bin");
             let default_test = weights_path.replace(".bin", "_test.bin");
             let test_path = args.get(3).map(|s| s.as_str()).unwrap_or(&default_test);
             validate_forward_pass(weights_path, test_path);
         }
         Some("gpu-test") => {
-            // Stage 1: GPU kernel validation
+            if has_help_flag(&args[2..]) {
+                print_gpu_test_help();
+                return;
+            }
             gpu_kernel_test();
         }
         Some("gpu-backend-test") => {
-            // GPU backend validation: all primitives against CPU
+            if has_help_flag(&args[2..]) {
+                print_gpu_backend_test_help();
+                return;
+            }
             gpu_backend::validate_gpu_backend();
         }
         Some("gpu-bench") => {
-            // GPU vs CPU benchmark: per-primitive timing comparison
+            if has_help_flag(&args[2..]) {
+                print_gpu_bench_help();
+                return;
+            }
             gpu_backend::benchmark_gpu_vs_cpu();
         }
         Some("gpu-persistent-bench") => {
-            // Persistent GPU pipeline: data stays on device, single submit
+            if has_help_flag(&args[2..]) {
+                print_gpu_persistent_bench_help();
+                return;
+            }
             gpu_persistent::benchmark_persistent();
         }
         Some("backend-select") => {
-            // Test auto-selection at various dimensions
+            if has_help_flag(&args[2..]) {
+                print_backend_select_help();
+                return;
+            }
             println!("Backend auto-selection test\n");
             for dim in [128, 256, 512, 768, 1024] {
                 print!("  dim={dim}: ");
@@ -72,135 +99,412 @@ fn main() {
             let _ = backend::auto_select(1024, true, false, None);
         }
         Some("grad-test") => {
-            // Stage 3: gradient validation
+            if has_help_flag(&args[2..]) {
+                print_grad_test_help();
+                return;
+            }
             let test_path = args.get(2).map(|s| s.as_str()).unwrap_or("reference/gradient_test.bin");
             grad_test::validate_gradients(test_path);
         }
         Some("list-gpus") => {
+            if has_help_flag(&args[2..]) {
+                print_list_gpus_help();
+                return;
+            }
             list_gpus();
         }
         Some("train") => {
-            // Stage 4: training from scratch (or resume from checkpoint)
-            let use_curriculum = !args.iter().any(|a| a == "--no-curriculum");
-            let word_level = args.iter().any(|a| a == "--word");
-            let force_cpu = args.iter().any(|a| a == "--cpu");
-            let force_gpu = args.iter().any(|a| a == "--gpu");
-            let resume_path = args.iter()
-                .position(|a| a == "--resume")
-                .and_then(|i| args.get(i + 1))
-                .map(|s| s.to_string());
-            let seed: u64 = args.iter()
-                .position(|a| a == "--seed")
-                .and_then(|i| args.get(i + 1))
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(42);
-            let train_seed: u64 = args.iter()
-                .position(|a| a == "--train-seed")
-                .and_then(|i| args.get(i + 1))
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(seed + 1295);
-            let threads: Option<usize> = args.iter()
-                .position(|a| a == "--threads")
-                .and_then(|i| args.get(i + 1))
-                .and_then(|s| s.parse().ok());
-            let gpu_device: Option<usize> = args.iter()
-                .position(|a| a == "--gpu-device")
-                .and_then(|i| args.get(i + 1))
-                .and_then(|s| s.parse().ok());
-            // Architecture flags
-            let n_bands: usize = args.iter()
-                .position(|a| a == "--n-bands")
-                .and_then(|i| args.get(i + 1))
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(64);
-            let n_head: usize = args.iter()
-                .position(|a| a == "--n-head")
-                .and_then(|i| args.get(i + 1))
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(4);
-            let n_layers: usize = args.iter()
-                .position(|a| a == "--n-layers")
-                .and_then(|i| args.get(i + 1))
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(4);
-            let maestro_dim: usize = args.iter()
-                .position(|a| a == "--maestro-dim")
-                .and_then(|i| args.get(i + 1))
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(16);
-            let block_size: usize = args.iter()
-                .position(|a| a == "--block-size")
-                .and_then(|i| args.get(i + 1))
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(256);
-            let rk4_steps: usize = args.iter()
-                .position(|a| a == "--rk4-steps")
-                .and_then(|i| args.get(i + 1))
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(8);
-            let bpe_path: Option<String> = args.iter()
-                .position(|a| a == "--bpe")
-                .and_then(|i| args.get(i + 1))
-                .map(|s| s.to_string());
-            let model_config = model::ModelConfig {
-                n_bands, n_head, n_layers, maestro_dim, block_size,
-                rk4_n_steps: rk4_steps,
-            };
-            // Collect positional args, skipping flags and their values
-            let flags_with_values = [
-                "--resume", "--seed", "--train-seed", "--threads",
-                "--n-bands", "--n-head", "--n-layers", "--maestro-dim",
-                "--block-size", "--rk4-steps", "--gpu-device", "--bpe",
-            ];
-            let mut positional: Vec<&str> = Vec::new();
-            let mut skip_next = false;
-            for a in &args[2..] {
-                if skip_next { skip_next = false; continue; }
-                if flags_with_values.contains(&a.as_str()) { skip_next = true; continue; }
-                if a.starts_with("--") { continue; }
-                positional.push(a);
+            if has_help_flag(&args[2..]) {
+                print_train_help();
+                return;
             }
-            let data_path = positional.first().copied().unwrap_or("data/input.txt");
-            let n_iters: usize = positional.get(1).and_then(|s| s.parse().ok()).unwrap_or(3000);
-            let batch_size: usize = positional.get(2).and_then(|s| s.parse().ok()).unwrap_or(4);
-            let seq_len: usize = positional.get(3).and_then(|s| s.parse().ok()).unwrap_or(64);
-            let lr: f32 = positional.get(4).and_then(|s| s.parse().ok()).unwrap_or(3e-4);
-            train::train_with_config(train::TrainConfig {
-                data_path: data_path.to_string(),
-                n_iters,
-                batch_size,
-                seq_len,
-                lr,
-                use_curriculum,
-                word_level,
-                bpe_path,
-                resume_path,
-                checkpoint_every: 500,
-                model_seed: seed,
-                train_seed,
-                threads,
-                force_cpu,
-                force_gpu,
-                gpu_device,
-                model_config,
-            });
+            run_train(&args);
         }
-        _ => {
-            println!("Usage:");
-            println!("  kerr-engine gpu-test              Stage 1: GPU kernel validation");
-            println!("  kerr-engine gpu-backend-test      GPU backend: validate all primitives vs CPU");
-            println!("  kerr-engine validate <model.bin>  Stage 2: full forward pass validation");
-            println!("  kerr-engine grad-test [test.bin]  Stage 3: gradient validation");
-            println!("  kerr-engine list-gpus             List available GPU adapters");
-            println!("  kerr-engine train [data] [iters] [batch] [seq_len] [lr] [flags]");
-            println!("    Training flags: --seed N, --train-seed N, --threads N, --cpu, --gpu");
-            println!("    --no-curriculum, --word, --bpe FILE, --resume FILE, --gpu-device N");
-            println!("    Architecture:   --n-bands N, --n-head N, --n-layers N, --maestro-dim N");
-            println!("    --block-size N, --rk4-steps N");
-            println!("                                    Stage 4: train from scratch (or resume)");
+        Some(cmd) => {
+            eprintln!("Unknown command: {cmd}\n");
+            eprintln!("Run 'kerr-engine --help' to see available commands.");
+            std::process::exit(1);
         }
+        _ => unreachable!(),
     }
 }
+
+// ─── Help system ──────────────────────────────────────────────
+
+fn has_help_flag(args: &[String]) -> bool {
+    args.iter().any(|a| a == "--help" || a == "-h")
+}
+
+fn print_main_help() {
+    println!("kerr-engine v0.2.0 — wave-native training and inference for Kerr-ODE models");
+    println!();
+    println!("USAGE:");
+    println!("    kerr-engine <COMMAND> [OPTIONS]");
+    println!();
+    println!("COMMANDS:");
+    println!("    train                Train a model from scratch or resume from checkpoint");
+    println!("    validate             Validate forward pass against Python reference");
+    println!("    grad-test            Validate analytical gradients against PyTorch autograd");
+    println!("    list-gpus            List available GPU adapters");
+    println!("    gpu-test             Stage 1: single Euler step GPU kernel validation");
+    println!("    gpu-backend-test     Validate all GPU primitives against CPU reference");
+    println!("    gpu-bench            Benchmark GPU vs CPU per-primitive timing");
+    println!("    gpu-persistent-bench Benchmark persistent GPU pipeline vs per-call");
+    println!("    backend-select       Test auto-selection logic at various dimensions");
+    println!();
+    println!("Run 'kerr-engine <COMMAND> --help' for detailed help on any command.");
+    println!();
+    println!("QUICK START:");
+    println!("    # Train on Shakespeare with defaults (char-level, 128-dim, 4 layers)");
+    println!("    kerr-engine train data/input.txt");
+    println!();
+    println!("    # Train with BPE tokenizer (subword vocabulary)");
+    println!("    kerr-engine train data/corpus.txt --bpe tokenizer.json");
+    println!();
+    println!("    # Train a larger model (768-dim, 12 heads)");
+    println!("    kerr-engine train data/input.txt 5000 --n-bands 384 --n-head 12");
+    println!();
+    println!("    # Resume training from a checkpoint");
+    println!("    kerr-engine train data/input.txt 5000 --resume checkpoint_iter3000.bin");
+    println!();
+    println!("ARCHITECTURE:");
+    println!("    The Kerr-ODE replaces the standard MLP in transformer blocks with a");
+    println!("    nonlinear ODE derived from coupled optical resonators. Frozen harmonic");
+    println!("    embeddings encode tokens as phase positions on the unit circle.");
+    println!();
+    println!("    Block 0: Attention + PerBandLinear (analytical, near-identity)");
+    println!("    Blocks 1-N: Attention + KerrMaestroAdd (Kerr-ODE + global maestro sync)");
+    println!();
+    println!("    At 128-dim, trains 3x faster than PyTorch+CUDA on CPU alone.");
+    println!("    At 768-dim, GPU acceleration via WGSL shaders on any vendor hardware.");
+    println!();
+    println!("SOURCE: https://github.com/atech-hub/kerr-engine");
+    println!("PAPER:  https://github.com/atech-hub/Wave-Coherence-as-a-Computational-Primitive");
+}
+
+fn print_train_help() {
+    println!("kerr-engine train — Train a Kerr-ODE model");
+    println!();
+    println!("USAGE:");
+    println!("    kerr-engine train [DATA] [ITERS] [BATCH] [SEQ_LEN] [LR] [OPTIONS]");
+    println!();
+    println!("POSITIONAL ARGUMENTS:");
+    println!("    DATA         Path to training data text file         [default: data/input.txt]");
+    println!("    ITERS        Number of training iterations           [default: 3000]");
+    println!("    BATCH        Batch size (parallelised across threads) [default: 4]");
+    println!("    SEQ_LEN      Sequence length per sample              [default: 64]");
+    println!("    LR           Learning rate for Adam optimizer         [default: 3e-4]");
+    println!();
+    println!("TOKENIZER:");
+    println!("    --word              Word-level tokenization (split on whitespace, lowercase,");
+    println!("                        separate punctuation, min_count=3 frequency threshold).");
+    println!("                        Vocab is built from the training data.");
+    println!();
+    println!("    --bpe FILE          BPE subword tokenization. FILE is a HuggingFace");
+    println!("                        tokenizer.json (GPT-2, Llama, Qwen, etc). Vocab comes");
+    println!("                        from the tokenizer file, not the training data.");
+    println!("                        Download from huggingface.co/<model>/raw/main/tokenizer.json");
+    println!();
+    println!("    (default)           Character-level tokenization. One token per character.");
+    println!("                        Vocab is the set of unique characters in the data.");
+    println!();
+    println!("TRAINING:");
+    println!("    --seed N            Model initialisation seed         [default: 42]");
+    println!("    --train-seed N      Training RNG seed (sampling)      [default: seed+1295]");
+    println!("    --resume FILE       Resume from a .bin checkpoint. Training continues from");
+    println!("                        the saved iteration with restored weights, optimizer");
+    println!("                        state, and RNG. Supports cross-corpus resume with");
+    println!("                        automatic vocab resizing.");
+    println!("    --no-curriculum     Disable progressive curriculum. By default, training");
+    println!("                        starts with 8 bands and opens to all bands in 3 stages.");
+    println!("                        Use this flag to train with all bands from iteration 0.");
+    println!();
+    println!("COMPUTE:");
+    println!("    --threads N         Number of worker threads (batch parallelism).");
+    println!("                        Default: auto-detect, capped at batch size.");
+    println!("    --cpu               Force CPU backend even at large dimensions.");
+    println!("    --gpu               Force GPU backend even at small dimensions.");
+    println!("    --gpu-device N      Select GPU adapter by index (see 'list-gpus').");
+    println!();
+    println!("ARCHITECTURE:");
+    println!("    These flags define the model structure. All are stored in v2 checkpoints");
+    println!("    and auto-detected on resume. Only needed for initial training.");
+    println!();
+    println!("    --n-bands N         Harmonic frequency bands. Embedding dim = 2 * N_BANDS.");
+    println!("                        64 bands = 128-dim, 384 bands = 768-dim.  [default: 64]");
+    println!("    --n-head N          Number of attention heads. Must divide n_embd.");
+    println!("                                                                  [default: 4]");
+    println!("    --n-layers N        Number of transformer blocks. Block 0 uses PerBandLinear,");
+    println!("                        blocks 1+ use Kerr-ODE + Maestro.         [default: 4]");
+    println!("    --maestro-dim N     Maestro bottleneck width. Controls global sync capacity.");
+    println!("                        16 is optimal for 128-dim.                [default: 16]");
+    println!("    --block-size N      Maximum sequence length (context window).  [default: 256]");
+    println!("    --rk4-steps N       ODE integration steps per layer. More steps = more");
+    println!("                        accurate but slower. 8 is well-validated.  [default: 8]");
+    println!();
+    println!("OUTPUT:");
+    println!("    Checkpoints saved every 500 iterations as checkpoint_iter<N>.bin");
+    println!("    Final checkpoint saved as checkpoint_final.bin");
+    println!("    Training summary saved as training_summary.json");
+    println!("    Validation loss + sample text printed every 300 iterations");
+    println!();
+    println!("EXAMPLES:");
+    println!("    # Minimal: train on Shakespeare with all defaults");
+    println!("    kerr-engine train data/input.txt");
+    println!();
+    println!("    # Custom: 5000 iterations, batch 8, sequence length 128");
+    println!("    kerr-engine train data/input.txt 5000 8 128 3e-4");
+    println!();
+    println!("    # BPE tokenizer with Qwen vocabulary");
+    println!("    kerr-engine train data/corpus.txt 10000 --bpe qwen_tokenizer.json");
+    println!();
+    println!("    # Larger model on GPU");
+    println!("    kerr-engine train data/input.txt 5000 --n-bands 384 --n-head 12 --gpu");
+    println!();
+    println!("    # Resume training on new data");
+    println!("    kerr-engine train data/new_corpus.txt 3000 --resume checkpoint_final.bin");
+    println!();
+    println!("    # Deterministic training with specific seeds");
+    println!("    kerr-engine train data/input.txt --seed 123 --train-seed 456");
+    println!();
+    println!("    # No curriculum, word-level, 4 threads");
+    println!("    kerr-engine train data/input.txt --word --no-curriculum --threads 4");
+}
+
+fn print_validate_help() {
+    println!("kerr-engine validate — Validate forward pass against Python reference");
+    println!();
+    println!("USAGE:");
+    println!("    kerr-engine validate [MODEL] [TEST]");
+    println!();
+    println!("ARGUMENTS:");
+    println!("    MODEL    Path to model weights (.bin)     [default: model.bin]");
+    println!("    TEST     Path to test vectors (.bin)      [default: <MODEL>_test.bin]");
+    println!();
+    println!("Stage 2 validation. Loads a model exported from Python, runs a forward pass");
+    println!("on test input tokens, and compares output logits against Python reference.");
+    println!("Tolerance: 1e-3 (PASS), <0.01 (CLOSE, acceptable), >=0.01 (FAIL).");
+    println!();
+    println!("The test vectors file contains input tokens and expected logits, exported");
+    println!("from the Python training script using export_model_and_test_vectors().");
+    println!();
+    println!("EXAMPLES:");
+    println!("    kerr-engine validate");
+    println!("    kerr-engine validate model.bin");
+    println!("    kerr-engine validate model.bin model_test.bin");
+}
+
+fn print_grad_test_help() {
+    println!("kerr-engine grad-test — Validate analytical gradients against PyTorch autograd");
+    println!();
+    println!("USAGE:");
+    println!("    kerr-engine grad-test [TEST_FILE]");
+    println!();
+    println!("ARGUMENTS:");
+    println!("    TEST_FILE    Path to gradient reference file    [default: reference/gradient_test.bin]");
+    println!();
+    println!("Stage 3 validation. Loads PyTorch autograd reference gradients and compares");
+    println!("against Rust hand-derived analytical gradients. Validates that the backward");
+    println!("pass produces correct gradients for all parameter types.");
+    println!();
+    println!("EXAMPLES:");
+    println!("    kerr-engine grad-test");
+    println!("    kerr-engine grad-test reference/gradient_test.bin");
+}
+
+fn print_list_gpus_help() {
+    println!("kerr-engine list-gpus — List available GPU adapters");
+    println!();
+    println!("USAGE:");
+    println!("    kerr-engine list-gpus");
+    println!();
+    println!("Enumerates all GPU adapters visible to WGPU (Vulkan, DirectX 12, Metal).");
+    println!("Shows adapter name, backend, and device type for each.");
+    println!("Use the index with --gpu-device N when training to select a specific GPU.");
+    println!();
+    println!("EXAMPLE OUTPUT:");
+    println!("    [0] NVIDIA GeForce RTX 4070 Ti (Vulkan)");
+    println!("        Device type: DiscreteGpu");
+    println!("    [1] NVIDIA GeForce RTX 4070 Ti (Dx12)");
+    println!("        Device type: DiscreteGpu");
+}
+
+fn print_gpu_test_help() {
+    println!("kerr-engine gpu-test — Stage 1 GPU kernel validation");
+    println!();
+    println!("USAGE:");
+    println!("    kerr-engine gpu-test");
+    println!();
+    println!("Runs a single Kerr-ODE Euler step on GPU and compares against CPU reference.");
+    println!("This is the most basic GPU validation — confirms that the WGSL shader produces");
+    println!("correct results for the core computation. Tolerance: 1e-5.");
+    println!();
+    println!("Uses 64 bands with dt=0.01, gamma=0.1. No model or data required.");
+}
+
+fn print_gpu_backend_test_help() {
+    println!("kerr-engine gpu-backend-test — Validate all GPU primitives against CPU");
+    println!();
+    println!("USAGE:");
+    println!("    kerr-engine gpu-backend-test");
+    println!();
+    println!("Runs every ComputeBackend operation (linear, layer_norm, GELU, kerr_ode,");
+    println!("attention, backward passes) on both GPU and CPU, comparing results.");
+    println!("Tolerance: 1e-4 per primitive. This validates the full GpuBackend.");
+    println!();
+    println!("No model or data required. Uses randomly generated test inputs.");
+}
+
+fn print_gpu_bench_help() {
+    println!("kerr-engine gpu-bench — Benchmark GPU vs CPU per-primitive timing");
+    println!();
+    println!("USAGE:");
+    println!("    kerr-engine gpu-bench");
+    println!();
+    println!("Times every ComputeBackend operation on GPU vs CPU at multiple dimensions.");
+    println!("Shows per-primitive speedup/slowdown and identifies the crossover point");
+    println!("where GPU becomes faster than CPU.");
+    println!();
+    println!("At 128-dim, CPU wins (GPU dispatch overhead dominates).");
+    println!("At 768-dim+, GPU wins (O(n^2) matmul overtakes fixed dispatch cost).");
+}
+
+fn print_gpu_persistent_bench_help() {
+    println!("kerr-engine gpu-persistent-bench — Benchmark persistent GPU pipeline");
+    println!();
+    println!("USAGE:");
+    println!("    kerr-engine gpu-persistent-bench");
+    println!();
+    println!("Benchmarks the persistent GPU pipeline (weights uploaded once, scratch buffers");
+    println!("pre-allocated, single command encoder submit) against per-call GPU and CPU.");
+    println!("Shows the theoretical maximum GPU speedup when dispatch overhead is eliminated.");
+    println!();
+    println!("Persistent pipeline is ~296x faster than per-call GPU for Kerr-ODE at 128-dim.");
+    println!("CPU still wins at 128-dim. Estimated crossover: ~700-800 dim.");
+}
+
+fn print_backend_select_help() {
+    println!("kerr-engine backend-select — Test auto-selection logic");
+    println!();
+    println!("USAGE:");
+    println!("    kerr-engine backend-select");
+    println!();
+    println!("Shows which compute backend (CPU or GPU) would be auto-selected at various");
+    println!("embedding dimensions (128, 256, 512, 768, 1024). Also shows the effect of");
+    println!("--cpu and --gpu override flags.");
+    println!();
+    println!("Default threshold: CPU below 768-dim, GPU at 768-dim and above.");
+}
+
+// ─── Train command ────────────────────────────────────────────
+
+fn run_train(args: &[String]) {
+    let use_curriculum = !args.iter().any(|a| a == "--no-curriculum");
+    let word_level = args.iter().any(|a| a == "--word");
+    let force_cpu = args.iter().any(|a| a == "--cpu");
+    let force_gpu = args.iter().any(|a| a == "--gpu");
+    let resume_path = args.iter()
+        .position(|a| a == "--resume")
+        .and_then(|i| args.get(i + 1))
+        .map(|s| s.to_string());
+    let seed: u64 = args.iter()
+        .position(|a| a == "--seed")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(42);
+    let train_seed: u64 = args.iter()
+        .position(|a| a == "--train-seed")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(seed + 1295);
+    let threads: Option<usize> = args.iter()
+        .position(|a| a == "--threads")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse().ok());
+    let gpu_device: Option<usize> = args.iter()
+        .position(|a| a == "--gpu-device")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse().ok());
+    // Architecture flags
+    let n_bands: usize = args.iter()
+        .position(|a| a == "--n-bands")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(64);
+    let n_head: usize = args.iter()
+        .position(|a| a == "--n-head")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4);
+    let n_layers: usize = args.iter()
+        .position(|a| a == "--n-layers")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4);
+    let maestro_dim: usize = args.iter()
+        .position(|a| a == "--maestro-dim")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(16);
+    let block_size: usize = args.iter()
+        .position(|a| a == "--block-size")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(256);
+    let rk4_steps: usize = args.iter()
+        .position(|a| a == "--rk4-steps")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8);
+    let bpe_path: Option<String> = args.iter()
+        .position(|a| a == "--bpe")
+        .and_then(|i| args.get(i + 1))
+        .map(|s| s.to_string());
+    let model_config = model::ModelConfig {
+        n_bands, n_head, n_layers, maestro_dim, block_size,
+        rk4_n_steps: rk4_steps,
+    };
+    // Collect positional args, skipping flags and their values
+    let flags_with_values = [
+        "--resume", "--seed", "--train-seed", "--threads",
+        "--n-bands", "--n-head", "--n-layers", "--maestro-dim",
+        "--block-size", "--rk4-steps", "--gpu-device", "--bpe",
+    ];
+    let mut positional: Vec<&str> = Vec::new();
+    let mut skip_next = false;
+    for a in &args[2..] {
+        if skip_next { skip_next = false; continue; }
+        if flags_with_values.contains(&a.as_str()) { skip_next = true; continue; }
+        if a.starts_with("--") { continue; }
+        positional.push(a);
+    }
+    let data_path = positional.first().copied().unwrap_or("data/input.txt");
+    let n_iters: usize = positional.get(1).and_then(|s| s.parse().ok()).unwrap_or(3000);
+    let batch_size: usize = positional.get(2).and_then(|s| s.parse().ok()).unwrap_or(4);
+    let seq_len: usize = positional.get(3).and_then(|s| s.parse().ok()).unwrap_or(64);
+    let lr: f32 = positional.get(4).and_then(|s| s.parse().ok()).unwrap_or(3e-4);
+    train::train_with_config(train::TrainConfig {
+        data_path: data_path.to_string(),
+        n_iters,
+        batch_size,
+        seq_len,
+        lr,
+        use_curriculum,
+        word_level,
+        bpe_path,
+        resume_path,
+        checkpoint_every: 500,
+        model_seed: seed,
+        train_seed,
+        threads,
+        force_cpu,
+        force_gpu,
+        gpu_device,
+        model_config,
+    });
+}
+
+// ─── Validation functions ─────────────────────────────────────
 
 fn gpu_kernel_test() {
     println!("Stage 1 — single Euler step GPU validation\n");
