@@ -251,6 +251,19 @@ pub struct ModelWeights {
 impl ModelWeights {
     /// Full forward pass: token indices → logits.
     pub fn forward(&self, tokens: &[usize]) -> Vec<Vec<f32>> {
+        self.forward_with_memory(tokens, None)
+    }
+
+    /// Forward pass with optional wave memory injection.
+    ///
+    /// `memory_offsets` is a slice of per-layer (r_offset, s_offset) pairs.
+    /// Each offset is added to the Kerr-ODE initial conditions before RK4.
+    /// When None, the code path is identical to `forward()` (bit-identical).
+    pub fn forward_with_memory(
+        &self,
+        tokens: &[usize],
+        memory_offsets: Option<&[(&[f32], &[f32])]>,
+    ) -> Vec<Vec<f32>> {
         let t = tokens.len();
         let n_embd = self.config.n_embd();
         assert!(t <= self.config.block_size);
@@ -265,9 +278,19 @@ impl ModelWeights {
             hidden.push(h);
         }
 
-        // Process through blocks
+        // Process through blocks — track ODE layer index for memory injection
+        let mut ode_layer = 0usize;
         for block in &self.blocks {
-            hidden = self.forward_block(block, &hidden);
+            let mem = match (&block.ffn, memory_offsets) {
+                (FfnWeights::KerrMaestro(_), Some(offsets)) if ode_layer < offsets.len() => {
+                    let m = Some(offsets[ode_layer]);
+                    ode_layer += 1;
+                    m
+                }
+                (FfnWeights::KerrMaestro(_), _) => { ode_layer += 1; None }
+                _ => None, // PerBandLinear — no ODE, no memory
+            };
+            hidden = self.forward_block(block, &hidden, mem);
         }
 
         // Final layer norm + LM head
@@ -281,7 +304,12 @@ impl ModelWeights {
         logits
     }
 
-    fn forward_block(&self, block: &BlockWeights, hidden: &[Vec<f32>]) -> Vec<Vec<f32>> {
+    fn forward_block(
+        &self,
+        block: &BlockWeights,
+        hidden: &[Vec<f32>],
+        memory: Option<(&[f32], &[f32])>,
+    ) -> Vec<Vec<f32>> {
         let t = hidden.len();
         let n_embd = self.config.n_embd();
 
@@ -304,7 +332,7 @@ impl ModelWeights {
             .collect();
         let ffn_out = match &block.ffn {
             FfnWeights::PerBand(w) => self.per_band_linear(w, &normed_2),
-            FfnWeights::KerrMaestro(w) => self.kerr_maestro_add(w, &normed_2),
+            FfnWeights::KerrMaestro(w) => self.kerr_maestro_add_with_memory(w, &normed_2, memory),
         };
         for i in 0..t {
             for j in 0..n_embd { h[i][j] += ffn_out[i][j]; }
@@ -410,14 +438,23 @@ impl ModelWeights {
     }
 
     pub fn kerr_maestro_add(&self, weights: &KerrMaestroAddWeights, x: &[Vec<f32>]) -> Vec<Vec<f32>> {
+        self.kerr_maestro_add_with_memory(weights, x, None)
+    }
+
+    pub fn kerr_maestro_add_with_memory(
+        &self,
+        weights: &KerrMaestroAddWeights,
+        x: &[Vec<f32>],
+        memory: Option<(&[f32], &[f32])>,
+    ) -> Vec<Vec<f32>> {
         let t = x.len();
         let mut result = Vec::with_capacity(t);
 
         for pos in 0..t {
-            // Kerr path
-            let kerr_out = self.kerr_ode_forward(&weights.kerr, &x[pos]);
+            // Kerr path (with optional memory injection)
+            let kerr_out = self.kerr_ode_forward_with_memory(&weights.kerr, &x[pos], memory);
 
-            // Maestro path
+            // Maestro path (no memory injection — global coordination only)
             let maestro_out = self.maestro_forward(&weights.maestro, &x[pos]);
 
             // Combine + project
@@ -435,6 +472,20 @@ impl ModelWeights {
     }
 
     pub fn kerr_ode_forward(&self, weights: &KerrWeights, x: &[f32]) -> Vec<f32> {
+        self.kerr_ode_forward_with_memory(weights, x, None)
+    }
+
+    /// Kerr-ODE forward pass with optional wave memory injection.
+    ///
+    /// When `memory` is Some((r_offsets, s_offsets)), the offsets are added
+    /// to the initial conditions before RK4 integration. When None, the
+    /// code path is identical to the original (bit-identical baseline).
+    pub fn kerr_ode_forward_with_memory(
+        &self,
+        weights: &KerrWeights,
+        x: &[f32],
+        memory: Option<(&[f32], &[f32])>,
+    ) -> Vec<f32> {
         let n_bands = weights.gamma_raw.len();
         let n_embd = n_bands * 2;
         let n_steps = weights.rk4_n_steps;
@@ -446,6 +497,14 @@ impl ModelWeights {
         for k in 0..n_bands {
             r[k] = x[k * 2];
             s[k] = x[k * 2 + 1];
+        }
+
+        // Wave memory injection: add offsets to initial conditions
+        if let Some((r_mem, s_mem)) = memory {
+            for k in 0..n_bands.min(r_mem.len()) {
+                r[k] += r_mem[k];
+                s[k] += s_mem[k];
+            }
         }
 
         // Compute gamma (softplus of raw)
@@ -466,6 +525,118 @@ impl ModelWeights {
             out[k * 2 + 1] = s[k];
         }
         out
+    }
+
+    /// Extract final ODE states from all layers and positions.
+    /// Returns ode_states[ode_layer] = (r_avg, s_avg) averaged across positions.
+    /// Used for wave memory accumulation — run once per conversation.
+    pub fn extract_ode_states(
+        &self,
+        tokens: &[usize],
+        memory_offsets: Option<&[(&[f32], &[f32])]>,
+    ) -> Vec<(Vec<f32>, Vec<f32>)> {
+        let t = tokens.len();
+        let n_embd = self.config.n_embd();
+        let n_bands = self.config.n_bands;
+        assert!(t <= self.config.block_size);
+
+        // Embedding + positional
+        let mut hidden: Vec<Vec<f32>> = Vec::with_capacity(t);
+        for (pos, &tok) in tokens.iter().enumerate() {
+            let mut h = vec![0.0f32; n_embd];
+            for i in 0..n_embd { h[i] = self.wte_phase[tok][i] + self.wpe[pos][i]; }
+            hidden.push(h);
+        }
+
+        let mut ode_states: Vec<(Vec<f32>, Vec<f32>)> = Vec::new();
+        let mut ode_layer = 0usize;
+
+        for block in &self.blocks {
+            // Attention + residual
+            let normed_1: Vec<Vec<f32>> = hidden.iter()
+                .map(|h| layer_norm(h, &block.ln_1.weight, &block.ln_1.bias))
+                .collect();
+            let attn_out = self.causal_self_attention(&block.attn, &normed_1);
+            let mut h: Vec<Vec<f32>> = (0..t).map(|i| {
+                let mut v = vec![0.0f32; n_embd];
+                for j in 0..n_embd { v[j] = hidden[i][j] + attn_out[i][j]; }
+                v
+            }).collect();
+
+            // FFN
+            let normed_2: Vec<Vec<f32>> = h.iter()
+                .map(|x| layer_norm(x, &block.ln_2.weight, &block.ln_2.bias))
+                .collect();
+
+            match &block.ffn {
+                FfnWeights::PerBand(w) => {
+                    let ffn_out = self.per_band_linear(w, &normed_2);
+                    for i in 0..t {
+                        for j in 0..n_embd { h[i][j] += ffn_out[i][j]; }
+                    }
+                }
+                FfnWeights::KerrMaestro(w) => {
+                    let mem = match memory_offsets {
+                        Some(offsets) if ode_layer < offsets.len() => Some(offsets[ode_layer]),
+                        _ => None,
+                    };
+
+                    // Extract ODE states from ALL positions, average them
+                    let mut avg_r = vec![0.0f32; n_bands];
+                    let mut avg_s = vec![0.0f32; n_bands];
+
+                    for pos in 0..t {
+                        // Run Kerr-ODE and capture final (r, s)
+                        let x = &normed_2[pos];
+                        let mut r = vec![0.0f32; n_bands];
+                        let mut s = vec![0.0f32; n_bands];
+                        for k in 0..n_bands {
+                            r[k] = x[k * 2];
+                            s[k] = x[k * 2 + 1];
+                        }
+                        if let Some((r_mem, s_mem)) = mem {
+                            for k in 0..n_bands.min(r_mem.len()) {
+                                r[k] += r_mem[k];
+                                s[k] += s_mem[k];
+                            }
+                        }
+                        let gamma: Vec<f32> = w.kerr.gamma_raw.iter()
+                            .map(|&g| softplus(g)).collect();
+                        let n_steps = w.kerr.rk4_n_steps;
+                        let dt = 1.0 / n_steps as f32;
+                        for _ in 0..n_steps {
+                            let (r_new, s_new) = rk4_step(&r, &s, dt, &gamma,
+                                &w.kerr.omega, w.kerr.alpha, w.kerr.beta);
+                            r = r_new;
+                            s = s_new;
+                        }
+                        for k in 0..n_bands {
+                            avg_r[k] += r[k];
+                            avg_s[k] += s[k];
+                        }
+                    }
+
+                    // Average across positions
+                    let scale = 1.0 / t as f32;
+                    for k in 0..n_bands {
+                        avg_r[k] *= scale;
+                        avg_s[k] *= scale;
+                    }
+                    ode_states.push((avg_r, avg_s));
+
+                    // Normal forward for hidden state propagation
+                    let ffn_out = self.kerr_maestro_add_with_memory(w, &normed_2, mem);
+                    for i in 0..t {
+                        for j in 0..n_embd { h[i][j] += ffn_out[i][j]; }
+                    }
+
+                    ode_layer += 1;
+                }
+            }
+            hidden = h;
+        }
+
+        ode_states
     }
 
     pub fn maestro_forward(&self, weights: &MaestroWeights, x: &[f32]) -> Vec<f32> {
