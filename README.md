@@ -47,7 +47,9 @@ cargo run --release -- train data/input.txt 3000 4 64 3e-4 --seed 42
 cargo run --release -- train data/corpus.txt 3000 --bpe tokenizer.json
 ```
 
-The engine auto-detects your hardware and selects the optimal backend. At 128-dim (the current model), CPU is faster. At 768+ dim, it automatically switches to GPU via WGPU — no CUDA required, works on NVIDIA, AMD, Intel, and Apple Silicon.
+The engine auto-detects your hardware and selects the optimal backend. At 128-dim, CPU is faster. At 768+ dim, it switches to GPU via WGPU — no CUDA required, works on NVIDIA, AMD, Intel, and Apple Silicon.
+
+**Honest scale note:** All headline benchmarks (3x faster, 98.1% MLP performance, 354K params) are at **128-dim on CPU**. This is the validated, production-tested configuration. GPU training at 768-dim has been benchmarked (1.72s/iter, 50 iterations) but not stress-tested in full training runs. Dimensions between 128 and 768 are untested. If you're scaling up, expect to be an early tester — please file issues.
 
 ---
 
@@ -166,7 +168,9 @@ Every gradient is hand-derived and verified against PyTorch's automatic differen
 | Final train loss | ~2.0 | 1.91 | Better convergence |
 | Final val loss | ~2.1 | 2.20 | Same range |
 
-**768-dim (12M params, Shakespeare, RTX 4070 Ti full GPU backend):**
+**768-dim (12M params, Shakespeare, RTX 4070 Ti full GPU backend) — BENCHMARK ONLY:**
+
+These numbers are from a **50-iteration benchmark**, not a complete training run. GPU training at this scale has not been stress-tested with full training (10K+ iterations), checkpoint saves, curriculum, or eval passes. The shaders are validated against CPU (bit-identical) but production GPU training at 768-dim is untested.
 
 | Metric | Value |
 |---|---|
@@ -285,10 +289,17 @@ At 128-dim, CPU wins. The GPU persistent pipeline eliminates 99.7% of dispatch o
 
 The Kerr-ODE is a novel architecture — it is NOT a standard transformer and does NOT work with existing inference clients out of the box.
 
-**What works today:**
-- **Train and generate** within the engine's CLI — `kerr-engine train` and the built-in `generate()` function
-- **Serve via [Kerr Server](https://github.com/atech-hub/kerr-server)** — OpenAI-compatible API server (640 lines Rust, SSE streaming, bearer token auth). Any chat UI that speaks the OpenAI protocol connects without modification. Verified with LM Studio 0.4.6.
+**Validated at 128-dim (CPU):**
+- **Train and generate** — full training pipeline with curriculum, checkpointing, eval. 3000+ iteration runs tested, loss trajectories match Python reference. This is production-ready.
+- **Serve via [Kerr Server](https://github.com/atech-hub/kerr-server)** — OpenAI-compatible API server (~1,900 lines Rust, SSE streaming, bearer token auth, wave memory). CPU inference at 128-dim is instant. Verified with LM Studio 0.4.6.
 - **BPE tokenizer support** — load any HuggingFace `tokenizer.json` (Qwen, Llama, GPT-2) via `--bpe` flag
+
+**Benchmarked but not production-tested (GPU, 768-dim):**
+- GPU forward and backward shaders validated against CPU (bit-identical)
+- 50-iteration benchmark at 768-dim: 1.72s/iter, correct convergence
+- **Full training runs (10K+ iters) at 768-dim have NOT been tested**
+- **Server inference is CPU-only** — at 768-dim, inference is ~1.7s per token (impractical for chat). GPU inference for the server is not implemented.
+- **Dimensions between 128 and 768 are untested**
 
 **What won't work natively:**
 - LM Studio, Ollama, llama.cpp — these expect dense MLP feed-forward layers. The Kerr-ODE uses RK4 integration with neighbour coupling, which no existing runtime supports natively. Use the [Kerr Server](https://github.com/atech-hub/kerr-server) as the bridge.
