@@ -6,12 +6,18 @@
 
 use wgpu::util::DeviceExt;
 
+use std::sync::Mutex;
+
 use crate::model::*;
+use crate::gpu_buffers::GpuBufferPool;
 
 /// GPU backend — dispatches to WGSL compute shaders.
 pub struct GpuBackend {
     pub(crate) device: wgpu::Device,
     pub(crate) queue: wgpu::Queue,
+    /// Buffer pool for reusable GPU buffers (eliminates per-dispatch allocation).
+    /// RefCell for interior mutability — the ComputeBackend trait takes &self.
+    pub(crate) pool: Mutex<GpuBufferPool>,
     pub(crate) matvec_pipeline: wgpu::ComputePipeline,
     pub(crate) matvec_layout: wgpu::BindGroupLayout,
     pub(crate) layer_norm_pipeline: wgpu::ComputePipeline,
@@ -684,8 +690,15 @@ impl GpuBackend {
             kerr_deriv_batch_layout,
             kerr_bwd_batch_pipeline,
             kerr_bwd_batch_layout,
+            pool: Mutex::new(GpuBufferPool::new()),
         }
     }
+
+    /// Invalidate cached weight buffers. Call after optimizer step.
+    pub fn invalidate_weight_cache(&self) {
+        self.pool.lock().unwrap().invalidate_weights();
+    }
+
 
     // ─── GPU dispatch helpers ───────────────────────────────────
 
@@ -747,22 +760,35 @@ impl GpuBackend {
     }
 
     /// Run matvec: y = W @ x + b (or y = W @ x if bias is empty).
+    /// Uses buffer pool for weight caching and scratch reuse.
     pub(crate) fn gpu_matvec(&self, w_flat: &[f32], x: &[f32], b: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
         let use_bias = if b.is_empty() { 0u32 } else { 1u32 };
 
-        let w_buf = self.storage_buf("w", w_flat);
-        let x_buf = self.storage_buf("x", x);
-        // Bias buffer: if no bias, still need a valid buffer (1 element placeholder)
+        // Phase 1: Ensure all buffers exist (mutable borrow of pool)
+        {
+            let mut pool = self.pool.lock().unwrap();
+            pool.ensure_data(&self.device, &self.queue, w_flat);
+            pool.ensure_data(&self.device, &self.queue, x);
+            let b_data = if b.is_empty() { &[0.0f32][..] } else { b };
+            pool.ensure_data(&self.device, &self.queue, b_data);
+            pool.ensure_scratch(&self.device, (out_dim * 4) as u64);
+            let params = MatvecParams {
+                out_dim: out_dim as u32,
+                in_dim: in_dim as u32,
+                use_bias,
+                _pad: 0,
+            };
+            pool.write_uniform(&self.device, &self.queue, &params);
+        }
+
+        // Phase 2: Borrow immutably for bind group + dispatch
         let b_data = if b.is_empty() { &[0.0f32][..] } else { b };
-        let b_buf = self.storage_buf("b", b_data);
-        let y_buf = self.output_buf("y", out_dim);
-        let params = MatvecParams {
-            out_dim: out_dim as u32,
-            in_dim: in_dim as u32,
-            use_bias,
-            _pad: 0,
-        };
-        let params_buf = self.uniform_buf("params", &params);
+        let pool = self.pool.lock().unwrap();
+        let w_buf = pool.data_ref(w_flat);
+        let x_buf = pool.data_ref(x);
+        let b_buf = pool.data_ref(b_data);
+        let y_buf = pool.scratch_ref();
+        let params_buf = pool.uniform_ref();
 
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("matvec_bg"),
@@ -785,8 +811,10 @@ impl GpuBackend {
             pass.dispatch_workgroups(workgroups, 1, 1);
         }
         self.queue.submit(Some(encoder.finish()));
+        drop(pool);
 
-        self.readback(&y_buf, out_dim)
+        // Phase 3: Readback (mutable borrow for staging)
+        self.pool.lock().unwrap().readback_scratch(&self.device, &self.queue, out_dim)
     }
 
     /// Run layer normalization on GPU.
