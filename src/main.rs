@@ -12,6 +12,7 @@ mod bpe;
 mod checkpoint;
 mod backward;
 mod gpu_buffers;
+mod gpu_ops;
 mod data;
 mod gpu;
 mod gpu_backend;

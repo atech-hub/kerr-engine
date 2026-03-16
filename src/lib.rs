@@ -8,6 +8,7 @@ pub mod bpe;
 pub mod checkpoint;
 pub mod data;
 pub mod gpu_buffers;
+pub mod gpu_ops;
 pub mod init;
 pub mod optim;
 pub mod rng;
