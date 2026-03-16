@@ -235,6 +235,9 @@ pub fn train_with_config(config: TrainConfig) {
         optimizer.step(&mut params, &grads);
         optim::unflatten_params(&mut model, &params);
 
+        // Invalidate GPU weight cache after weights change
+        compute_backend.invalidate_weight_cache();
+
         let iter_time = iter_start.elapsed();
 
         if iter % log_every == 0 || iter == config.n_iters - 1 {

@@ -18,9 +18,9 @@ pub struct GpuBufferPool {
     /// Weight/bias buffers cached by (data pointer, byte length).
     data_cache: HashMap<(usize, usize), wgpu::Buffer>,
 
-    /// Single scratch output buffer (resized as needed).
-    scratch: Option<wgpu::Buffer>,
-    scratch_size: u64,
+    /// Scratch output buffers by index (resized as needed per slot).
+    scratch: Vec<Option<wgpu::Buffer>>,
+    scratch_sizes: Vec<u64>,
 
     /// Single staging buffer for readback.
     staging: Option<wgpu::Buffer>,
@@ -35,8 +35,8 @@ impl GpuBufferPool {
     pub fn new() -> Self {
         Self {
             data_cache: HashMap::new(),
-            scratch: None,
-            scratch_size: 0,
+            scratch: Vec::new(),
+            scratch_sizes: Vec::new(),
             staging: None,
             staging_size: 0,
             uniform: None,
@@ -59,17 +59,21 @@ impl GpuBufferPool {
         }
     }
 
-    /// Ensure scratch output buffer is at least `n_bytes`.
-    pub fn ensure_scratch(&mut self, device: &wgpu::Device, n_bytes: u64) {
+    /// Ensure scratch output buffer at `slot` is at least `n_bytes`.
+    pub fn ensure_scratch(&mut self, device: &wgpu::Device, slot: usize, n_bytes: u64) {
         let size = n_bytes.max(16);
-        if size > self.scratch_size {
-            self.scratch = Some(device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("pool_scratch"),
+        while self.scratch.len() <= slot {
+            self.scratch.push(None);
+            self.scratch_sizes.push(0);
+        }
+        if size > self.scratch_sizes[slot] {
+            self.scratch[slot] = Some(device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
                 size,
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
                 mapped_at_creation: false,
             }));
-            self.scratch_size = size;
+            self.scratch_sizes[slot] = size;
         }
     }
 
@@ -97,9 +101,9 @@ impl GpuBufferPool {
         self.data_cache.get(&key).expect("data buffer not ensured")
     }
 
-    /// Get reference to the scratch output buffer.
-    pub fn scratch_ref(&self) -> &wgpu::Buffer {
-        self.scratch.as_ref().expect("scratch buffer not ensured")
+    /// Get reference to scratch output buffer at `slot`.
+    pub fn scratch_ref(&self, slot: usize) -> &wgpu::Buffer {
+        self.scratch[slot].as_ref().expect("scratch buffer not ensured")
     }
 
     /// Get reference to the uniform buffer.
@@ -109,8 +113,8 @@ impl GpuBufferPool {
 
     // ─── Readback ────────────────────────────────────────────
 
-    /// Read back f32 data from the scratch buffer.
-    pub fn readback_scratch(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, n_floats: usize) -> Vec<f32> {
+    /// Read back f32 data from scratch buffer at `slot`.
+    pub fn readback_scratch(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, slot: usize, n_floats: usize) -> Vec<f32> {
         let size = (n_floats * 4) as u64;
 
         // Ensure staging buffer
@@ -124,7 +128,7 @@ impl GpuBufferPool {
             self.staging_size = size;
         }
 
-        let scratch = self.scratch.as_ref().unwrap();
+        let scratch = self.scratch[slot].as_ref().unwrap();
         let staging = self.staging.as_ref().unwrap();
 
         let mut encoder = device.create_command_encoder(&Default::default());

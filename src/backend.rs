@@ -80,6 +80,10 @@ fn try_gpu_backend(gpu_device: Option<usize>) -> Option<crate::gpu_backend::GpuB
 
 /// Core compute operations that can run on CPU or GPU.
 pub trait ComputeBackend {
+    /// Invalidate cached weight buffers. Call after optimizer step changes weights.
+    /// No-op for CPU backend. GPU backend clears its buffer cache.
+    fn invalidate_weight_cache(&self) {}
+
     /// Linear: y = W @ x + b
     fn linear(&self, w: &[Vec<f32>], b: &[f32], x: &[f32]) -> Vec<f32>;
 

@@ -771,7 +771,7 @@ impl GpuBackend {
             pool.ensure_data(&self.device, &self.queue, x);
             let b_data = if b.is_empty() { &[0.0f32][..] } else { b };
             pool.ensure_data(&self.device, &self.queue, b_data);
-            pool.ensure_scratch(&self.device, (out_dim * 4) as u64);
+            pool.ensure_scratch(&self.device, 0, (out_dim * 4) as u64);
             let params = MatvecParams {
                 out_dim: out_dim as u32,
                 in_dim: in_dim as u32,
@@ -787,7 +787,7 @@ impl GpuBackend {
         let w_buf = pool.data_ref(w_flat);
         let x_buf = pool.data_ref(x);
         let b_buf = pool.data_ref(b_data);
-        let y_buf = pool.scratch_ref();
+        let y_buf = pool.scratch_ref(0);
         let params_buf = pool.uniform_ref();
 
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -814,7 +814,7 @@ impl GpuBackend {
         drop(pool);
 
         // Phase 3: Readback (mutable borrow for staging)
-        self.pool.lock().unwrap().readback_scratch(&self.device, &self.queue, out_dim)
+        self.pool.lock().unwrap().readback_scratch(&self.device, &self.queue, 0, out_dim)
     }
 
     /// Run layer normalization on GPU.
@@ -955,27 +955,35 @@ impl GpuBackend {
     /// Batched matvec forward: y[pos] = W @ x[pos] + b for all positions in one dispatch.
     pub(crate) fn gpu_matvec_batch(&self, w_flat: &[f32], x_flat: &[f32], b: &[f32], out_dim: usize, in_dim: usize, n_pos: usize) -> Vec<f32> {
         let use_bias = if b.is_empty() { 0u32 } else { 1u32 };
+        let out_total = n_pos * out_dim;
 
-        let w_buf = self.storage_buf("mvb_w", w_flat);
-        let x_buf = self.storage_buf("mvb_x", x_flat);
+        // Phase 1: ensure pooled buffers
+        {
+            let mut pool = self.pool.lock().unwrap();
+            pool.ensure_data(&self.device, &self.queue, w_flat);
+            pool.ensure_data(&self.device, &self.queue, x_flat);
+            let b_data = if b.is_empty() { &[0.0f32][..] } else { b };
+            pool.ensure_data(&self.device, &self.queue, b_data);
+            pool.ensure_scratch(&self.device, 0, (out_total * 4) as u64);
+            let params = MatvecBatchParams {
+                out_dim: out_dim as u32, in_dim: in_dim as u32,
+                n_pos: n_pos as u32, use_bias,
+            };
+            pool.write_uniform(&self.device, &self.queue, &params);
+        }
+
+        // Phase 2: bind + dispatch
         let b_data = if b.is_empty() { &[0.0f32][..] } else { b };
-        let b_buf = self.storage_buf("mvb_b", b_data);
-        let y_buf = self.output_buf("mvb_y", n_pos * out_dim);
-        let params = MatvecBatchParams {
-            out_dim: out_dim as u32, in_dim: in_dim as u32,
-            n_pos: n_pos as u32, use_bias,
-        };
-        let params_buf = self.uniform_buf("mvb_params", &params);
-
+        let pool = self.pool.lock().unwrap();
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("matvec_batch_bg"),
             layout: &self.matvec_batch_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: w_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: x_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: b_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: y_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: params_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 0, resource: pool.data_ref(w_flat).as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: pool.data_ref(x_flat).as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: pool.data_ref(b_data).as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: pool.scratch_ref(0).as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: pool.uniform_ref().as_entire_binding() },
             ],
         });
 
@@ -984,34 +992,41 @@ impl GpuBackend {
             let mut pass = encoder.begin_compute_pass(&Default::default());
             pass.set_pipeline(&self.matvec_batch_pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
-            let total = (n_pos * out_dim) as u32;
+            let total = out_total as u32;
             pass.dispatch_workgroups((total + 63) / 64, 1, 1);
         }
         self.queue.submit(Some(encoder.finish()));
+        drop(pool);
 
-        self.readback(&y_buf, n_pos * out_dim)
+        self.pool.lock().unwrap().readback_scratch(&self.device, &self.queue, 0, out_total)
     }
 
     /// Batched layer norm: one workgroup per position, all positions in one dispatch.
     pub(crate) fn gpu_layer_norm_batch(&self, x_flat: &[f32], weight: &[f32], bias: &[f32], dim: usize, n_pos: usize) -> Vec<f32> {
-        let x_buf = self.storage_buf("lnb_x", x_flat);
-        let w_buf = self.storage_buf("lnb_w", weight);
-        let b_buf = self.storage_buf("lnb_b", bias);
-        let y_buf = self.output_buf("lnb_y", n_pos * dim);
-        let params = LayerNormBatchParams {
-            dim: dim as u32, n_pos: n_pos as u32, _pad1: 0, _pad2: 0,
-        };
-        let params_buf = self.uniform_buf("lnb_params", &params);
+        let out_total = n_pos * dim;
 
+        {
+            let mut pool = self.pool.lock().unwrap();
+            pool.ensure_data(&self.device, &self.queue, x_flat);
+            pool.ensure_data(&self.device, &self.queue, weight);
+            pool.ensure_data(&self.device, &self.queue, bias);
+            pool.ensure_scratch(&self.device, 0, (out_total * 4) as u64);
+            let params = LayerNormBatchParams {
+                dim: dim as u32, n_pos: n_pos as u32, _pad1: 0, _pad2: 0,
+            };
+            pool.write_uniform(&self.device, &self.queue, &params);
+        }
+
+        let pool = self.pool.lock().unwrap();
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("layer_norm_batch_bg"),
             layout: &self.layer_norm_batch_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: x_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: w_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: b_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: y_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: params_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 0, resource: pool.data_ref(x_flat).as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: pool.data_ref(weight).as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: pool.data_ref(bias).as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: pool.scratch_ref(0).as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: pool.uniform_ref().as_entire_binding() },
             ],
         });
 
@@ -1023,8 +1038,9 @@ impl GpuBackend {
             pass.dispatch_workgroups(n_pos as u32, 1, 1);
         }
         self.queue.submit(Some(encoder.finish()));
+        drop(pool);
 
-        self.readback(&y_buf, n_pos * dim)
+        self.pool.lock().unwrap().readback_scratch(&self.device, &self.queue, 0, out_total)
     }
 
     /// Batched Kerr derivative: compute dr/ds for all positions in one dispatch.

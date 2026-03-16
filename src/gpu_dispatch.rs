@@ -10,6 +10,10 @@ use crate::model::*;
 // ─── ComputeBackend implementation ──────────────────────────────
 
 impl ComputeBackend for GpuBackend {
+    fn invalidate_weight_cache(&self) {
+        self.pool.lock().unwrap().invalidate_weights();
+    }
+
     fn linear(&self, w: &[Vec<f32>], b: &[f32], x: &[f32]) -> Vec<f32> {
         let out_dim = w.len();
         let in_dim = if out_dim > 0 { w[0].len() } else { 0 };
