@@ -186,6 +186,25 @@ pub trait ComputeBackend {
     /// Backward through GELU activation.
     fn gelu_backward(&self, d_y: &[f32], x: &[f32]) -> Vec<f32>;
 
+    /// Batched GELU backward: d_x[pos] = gelu_backward(d_y[pos], x[pos]) for all positions.
+    fn gelu_backward_batch(&self, d_ys: &[Vec<f32>], xs: &[Vec<f32>]) -> Vec<Vec<f32>> {
+        d_ys.iter().zip(xs.iter()).map(|(dy, x)| self.gelu_backward(dy, x)).collect()
+    }
+
+    /// Batched layer norm backward: all positions at once.
+    fn layer_norm_backward_batch(&self, d_ys: &[Vec<f32>], xs: &[Vec<f32>], weight: &[f32]) -> (Vec<Vec<f32>>, Vec<f32>, Vec<f32>) {
+        let n_embd = weight.len();
+        let mut total_dw = vec![0.0f32; n_embd];
+        let mut total_db = vec![0.0f32; n_embd];
+        let mut d_xs = Vec::with_capacity(d_ys.len());
+        for (dy, x) in d_ys.iter().zip(xs.iter()) {
+            let (dx, dw, db) = self.layer_norm_backward(dy, x, weight);
+            for i in 0..n_embd { total_dw[i] += dw[i]; total_db[i] += db[i]; }
+            d_xs.push(dx);
+        }
+        (d_xs, total_dw, total_db)
+    }
+
     /// Batched linear backward: d_x[pos] = W^T @ d_y[pos] for all positions in one dispatch.
     fn linear_backward_dx_batch(&self, d_y: &[Vec<f32>], w: &[Vec<f32>]) -> Vec<Vec<f32>>;
 

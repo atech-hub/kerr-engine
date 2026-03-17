@@ -529,9 +529,7 @@ impl ModelWeights {
                         process_b[i] += pr_db[i];
                     }
                     // GELU backward per position (maestro_dim elements, trivial)
-                    let d_squeezed_all: Vec<Vec<f32>> = (0..t).map(|pos| {
-                        backend.gelu_backward(&d_activated_all[pos], &squeezed_all[pos])
-                    }).collect();
+                    let d_squeezed_all = backend.gelu_backward_batch(&d_activated_all, &squeezed_all);
                     // Backward through squeeze linear (batched)
                     let d_maestro_inputs = backend.linear_backward_dx_batch(
                         &d_squeezed_all, &w.maestro.squeeze.w,
@@ -602,9 +600,7 @@ impl ModelWeights {
                         for j in 0..maestro_dim { out_process_w[i][j] += opr_dw[i][j]; }
                         out_process_b[i] += opr_db[i];
                     }
-                    let d_out_squeezed_all: Vec<Vec<f32>> = (0..t).map(|pos| {
-                        backend.gelu_backward(&d_out_activated_all[pos], &out_squeezed_all[pos])
-                    }).collect();
+                    let d_out_squeezed_all = backend.gelu_backward_batch(&d_out_activated_all, &out_squeezed_all);
                     let d_kerr_out_from_maestro_out = backend.linear_backward_dx_batch(
                         &d_out_squeezed_all, &w.maestro_out.squeeze.w,
                     );
@@ -653,9 +649,7 @@ impl ModelWeights {
                         for j in 0..maestro_dim { in_process_w[i][j] += ipr_dw[i][j]; }
                         in_process_b[i] += ipr_db[i];
                     }
-                    let d_in_squeezed_all: Vec<Vec<f32>> = (0..t).map(|pos| {
-                        backend.gelu_backward(&d_in_activated_all[pos], &in_squeezed_all[pos])
-                    }).collect();
+                    let d_in_squeezed_all = backend.gelu_backward_batch(&d_in_activated_all, &in_squeezed_all);
                     let d_input_from_maestro_in = backend.linear_backward_dx_batch(
                         &d_in_squeezed_all, &w.maestro_in.squeeze.w,
                     );
@@ -936,17 +930,14 @@ impl ModelWeights {
         let mut grads = GradAccum::zeros(self);
 
         let d_normed_all = backend.linear_backward_dx_batch(&d_logits, &self.lm_head);
-        let mut d_hidden: Vec<Vec<f32>> = Vec::with_capacity(total_pos);
-        for pos in 0..total_pos {
-            let (d_h, d_w, d_b) = backend.layer_norm_backward(
-                &d_normed_all[pos], &hidden[pos], &self.ln_f.weight,
-            );
-            for i in 0..n_embd {
-                grads.ln_f_weight[i] += d_w[i];
-                grads.ln_f_bias[i] += d_b[i];
-            }
-            d_hidden.push(d_h);
+        let (d_hidden, ln_f_dw, ln_f_db) = backend.layer_norm_backward_batch(
+            &d_normed_all, &hidden, &self.ln_f.weight,
+        );
+        for i in 0..n_embd {
+            grads.ln_f_weight[i] += ln_f_dw[i];
+            grads.ln_f_bias[i] += ln_f_db[i];
         }
+        let mut d_hidden = d_hidden;
         let (lm_dw, _) = backend.outer_product_accum(&d_logits, &normed, false);
         for i in 0..self.vocab_size {
             for j in 0..n_embd { grads.lm_head[i][j] += lm_dw[i][j]; }
@@ -1042,9 +1033,7 @@ impl ModelWeights {
                         for j in 0..maestro_dim { process_w[i][j] += pr_dw[i][j]; }
                         process_b[i] += pr_db[i];
                     }
-                    let d_squeezed_all: Vec<Vec<f32>> = (0..t).map(|pos| {
-                        backend.gelu_backward(&d_activated_all[pos], &squeezed_all[pos])
-                    }).collect();
+                    let d_squeezed_all = backend.gelu_backward_batch(&d_activated_all, &squeezed_all);
                     let d_maestro_inputs = backend.linear_backward_dx_batch(&d_squeezed_all, &w.maestro.squeeze.w);
                     let (sq_dw, sq_db) = backend.outer_product_accum(&d_squeezed_all, &bc.normed_2, true);
                     for i in 0..maestro_dim {
@@ -1102,9 +1091,7 @@ impl ModelWeights {
                         for j in 0..maestro_dim { out_process_w[i][j] += opr_dw[i][j]; }
                         out_process_b[i] += opr_db[i];
                     }
-                    let d_out_squeezed_all: Vec<Vec<f32>> = (0..t).map(|pos| {
-                        backend.gelu_backward(&d_out_activated_all[pos], &out_squeezed_all[pos])
-                    }).collect();
+                    let d_out_squeezed_all = backend.gelu_backward_batch(&d_out_activated_all, &out_squeezed_all);
                     let d_kerr_out_from_maestro_out = backend.linear_backward_dx_batch(&d_out_squeezed_all, &w.maestro_out.squeeze.w);
                     let (osq_dw, osq_db) = backend.outer_product_accum(&d_out_squeezed_all, &kerr_out_all, true);
                     for i in 0..maestro_dim {
@@ -1130,9 +1117,7 @@ impl ModelWeights {
                         for j in 0..maestro_dim { in_process_w[i][j] += ipr_dw[i][j]; }
                         in_process_b[i] += ipr_db[i];
                     }
-                    let d_in_squeezed_all: Vec<Vec<f32>> = (0..t).map(|pos| {
-                        backend.gelu_backward(&d_in_activated_all[pos], &in_squeezed_all[pos])
-                    }).collect();
+                    let d_in_squeezed_all = backend.gelu_backward_batch(&d_in_activated_all, &in_squeezed_all);
                     let d_input_from_maestro_in = backend.linear_backward_dx_batch(&d_in_squeezed_all, &w.maestro_in.squeeze.w);
                     let (isq_dw, isq_db) = backend.outer_product_accum(&d_in_squeezed_all, &bc.normed_2, true);
                     for i in 0..maestro_dim {
@@ -1148,15 +1133,17 @@ impl ModelWeights {
                 _ => unreachable!(),
             };
 
-            // LN2 backward
-            for pos in 0..t {
-                let (d_h1_from_ln2, d_w, d_b) = backend.layer_norm_backward(
-                    &d_normed_2_all[pos], &bc.h1[pos], &block.ln_2.weight,
+            // LN2 backward (batched)
+            {
+                let (d_h1_all, d_w, d_b) = backend.layer_norm_backward_batch(
+                    &d_normed_2_all, &bc.h1, &block.ln_2.weight,
                 );
                 for i in 0..n_embd {
                     bg.ln_2_weight[i] += d_w[i];
                     bg.ln_2_bias[i] += d_b[i];
-                    d_h1[pos][i] += d_h1_from_ln2[i];
+                }
+                for pos in 0..t {
+                    for i in 0..n_embd { d_h1[pos][i] += d_h1_all[pos][i]; }
                 }
             }
 
@@ -1213,19 +1200,20 @@ impl ModelWeights {
                 bg.attn_c_attn_b[i] += ca_db[i];
             }
 
-            // LN1 backward
-            d_hidden = Vec::with_capacity(t);
-            for pos in 0..t {
-                let (d_input, d_w, d_b) = backend.layer_norm_backward(
-                    &d_normed_1[pos], &bc.input[pos], &block.ln_1.weight,
+            // LN1 backward (batched)
+            {
+                let (d_input_all, d_w, d_b) = backend.layer_norm_backward_batch(
+                    &d_normed_1, &bc.input, &block.ln_1.weight,
                 );
                 for i in 0..n_embd {
                     bg.ln_1_weight[i] += d_w[i];
                     bg.ln_1_bias[i] += d_b[i];
                 }
-                let mut d_h = d_input;
-                for i in 0..n_embd { d_h[i] += d_h1[pos][i]; }
-                d_hidden.push(d_h);
+                d_hidden = (0..t).map(|pos| {
+                    let mut d_h = d_input_all[pos].clone();
+                    for i in 0..n_embd { d_h[i] += d_h1[pos][i]; }
+                    d_h
+                }).collect();
             }
         }
 
