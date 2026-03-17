@@ -19,6 +19,9 @@ pub struct GpuBackend {
     pub(crate) pool: Mutex<GpuBufferPool>,
     /// Resident weight buffers — uploaded once, updated after Adam step.
     pub(crate) resident: Mutex<Option<crate::gpu_resident::ResidentWeightBuffers>>,
+    /// Block counter for resident dispatch — tracks which FFN block is being processed.
+    /// Reset at start of each forward pass (update_weights call).
+    pub(crate) ffn_block_counter: std::sync::atomic::AtomicUsize,
     pub(crate) matvec_pipeline: wgpu::ComputePipeline,
     pub(crate) matvec_layout: wgpu::BindGroupLayout,
     pub(crate) layer_norm_pipeline: wgpu::ComputePipeline,
@@ -772,6 +775,7 @@ impl GpuBackend {
             rk4_combine_layout,
             pool: Mutex::new(GpuBufferPool::new()),
             resident: Mutex::new(None),
+            ffn_block_counter: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 

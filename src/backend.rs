@@ -90,6 +90,9 @@ pub trait ComputeBackend {
     /// Write updated weights back to GPU after Adam step (no-op for CPU).
     fn update_weights(&self, _model: &ModelWeights) {}
 
+    /// Reset FFN block counter for resident dispatch tracking (no-op for CPU).
+    fn reset_ffn_counter(&self) {}
+
     /// Linear: y = W @ x + b
     fn linear(&self, w: &[Vec<f32>], b: &[f32], x: &[f32]) -> Vec<f32>;
 

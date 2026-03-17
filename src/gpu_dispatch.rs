@@ -27,6 +27,10 @@ impl ComputeBackend for GpuBackend {
         }
     }
 
+    fn reset_ffn_counter(&self) {
+        self.ffn_block_counter.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
     fn linear(&self, w: &[Vec<f32>], b: &[f32], x: &[f32]) -> Vec<f32> {
         let out_dim = w.len();
         let in_dim = if out_dim > 0 { w[0].len() } else { 0 };
@@ -127,6 +131,8 @@ impl ComputeBackend for GpuBackend {
     }
 
     fn per_band_linear(&self, weights: &PerBandLinearWeights, x: &[Vec<f32>]) -> Vec<Vec<f32>> {
+        // Increment FFN block counter (keeps resident dispatch aligned with block index)
+        self.ffn_block_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let t = x.len();
         let n_bands = weights.band_w.len();
         let n_embd = n_bands * 2;
@@ -150,6 +156,7 @@ impl ComputeBackend for GpuBackend {
     }
 
     fn kerr_maestro_add(&self, weights: &KerrMaestroAddWeights, x: &[Vec<f32>]) -> Vec<Vec<f32>> {
+        self.ffn_block_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let t = x.len();
         let n_embd = x[0].len();
 
@@ -185,46 +192,89 @@ impl ComputeBackend for GpuBackend {
     fn kerr_dual_maestro_add(&self, weights: &KerrDualMaestroWeights, x: &[Vec<f32>]) -> Vec<Vec<f32>> {
         let t = x.len();
         let n_embd = x[0].len();
+        let maestro_dim = weights.maestro_in.squeeze.w.len();
 
-        // 1. Input maestro (batched): squeeze + gelu + process
+        // Check for resident buffers — if available, use them (no weight upload)
+        let resident = self.resident.lock().unwrap();
+        let block_idx = self.ffn_block_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        // Helper: resident linear batch — uses pre-uploaded weight buffer
+        let linear_batch_res = |w_buf: &wgpu::Buffer, b_buf: &wgpu::Buffer, xs: &[Vec<f32>], out_dim: usize, in_dim: usize| -> Vec<Vec<f32>> {
+            let n_pos = xs.len();
+            let x_flat: Vec<f32> = xs.iter().flat_map(|v| v.iter().copied()).collect();
+            let y_flat = self.gpu_matvec_batch_resident(w_buf, b_buf, &x_flat, out_dim, in_dim, n_pos, true);
+            y_flat.chunks(out_dim).map(|c| c.to_vec()).collect()
+        };
+
+        // Use resident buffers for this block if available
+        if let Some(ref res) = *resident {
+            if let Some(crate::gpu_resident::FfnResidentBuffers::KerrDualMaestro {
+                    gamma: _, omega: _, alpha_beta: _,
+                    in_squeeze_w, in_squeeze_b, in_process_w, in_process_b,
+                    out_squeeze_w, out_squeeze_b, out_process_w, out_process_b,
+                    out_proj_w, out_proj_b,
+                }) = res.ffn_buffers.get(block_idx) {
+                    // Use resident buffers for all linear ops
+                    // 1. Input maestro
+                    let mae_in_sq = linear_batch_res(in_squeeze_w, in_squeeze_b, x, maestro_dim, n_embd);
+                    let mae_in_act: Vec<f32> = mae_in_sq.iter()
+                        .flat_map(|v| v.iter().map(|&val| gelu_cpu(val))).collect();
+                    let mae_in_act_vecs: Vec<Vec<f32>> = mae_in_act.chunks(maestro_dim).map(|c| c.to_vec()).collect();
+                    let mae_in_out = linear_batch_res(in_process_w, in_process_b, &mae_in_act_vecs, n_embd, maestro_dim);
+
+                    let precond: Vec<Vec<f32>> = (0..t).map(|pos| {
+                        let mut p = vec![0.0f32; n_embd];
+                        for i in 0..n_embd { p[i] = x[pos][i] + mae_in_out[pos][i]; }
+                        p
+                    }).collect();
+
+                    // 2. ODE — uses fused batched path
+                    let kerr_outs = self.gpu_kerr_ode_batch_fused(&weights.kerr, &precond);
+
+                    // 3. Output maestro
+                    let mae_out_sq = linear_batch_res(out_squeeze_w, out_squeeze_b, &kerr_outs, maestro_dim, n_embd);
+                    let mae_out_act: Vec<f32> = mae_out_sq.iter()
+                        .flat_map(|v| v.iter().map(|&val| gelu_cpu(val))).collect();
+                    let mae_out_act_vecs: Vec<Vec<f32>> = mae_out_act.chunks(maestro_dim).map(|c| c.to_vec()).collect();
+                    let mae_out_out = linear_batch_res(out_process_w, out_process_b, &mae_out_act_vecs, n_embd, maestro_dim);
+
+                    let regulated: Vec<Vec<f32>> = (0..t).map(|pos| {
+                        let mut r = vec![0.0f32; n_embd];
+                        for i in 0..n_embd { r[i] = kerr_outs[pos][i] + mae_out_out[pos][i]; }
+                        r
+                    }).collect();
+
+                    // 4. Output projection
+                    return linear_batch_res(out_proj_w, out_proj_b, &regulated, n_embd, n_embd);
+            }
+        }
+        drop(resident);
+
+        // Fallback: non-resident path (uploads weights every call)
         let mae_in_sq = self.linear_batch(&weights.maestro_in.squeeze.w, &weights.maestro_in.squeeze.b, x);
         let mae_in_act: Vec<f32> = mae_in_sq.iter()
-            .flat_map(|v| v.iter().map(|&val| gelu_cpu(val)))
-            .collect();
-        let maestro_dim = weights.maestro_in.squeeze.w.len();
+            .flat_map(|v| v.iter().map(|&val| gelu_cpu(val))).collect();
         let mae_in_act_vecs: Vec<Vec<f32>> = mae_in_act.chunks(maestro_dim).map(|c| c.to_vec()).collect();
         let mae_in_out = self.linear_batch(&weights.maestro_in.process_1.w, &weights.maestro_in.process_1.b, &mae_in_act_vecs);
-
-        // Precondition: x + maestro_in output
         let precond: Vec<Vec<f32>> = (0..t).map(|pos| {
             let mut p = vec![0.0f32; n_embd];
             for i in 0..n_embd { p[i] = x[pos][i] + mae_in_out[pos][i]; }
             p
         }).collect();
-
-        // 2. Kerr-ODE on pre-conditioned input (fused GPU path)
         let kerr_outs = self.gpu_kerr_ode_batch_fused(&weights.kerr, &precond);
-
         if kerr_outs.iter().any(|h| h.iter().any(|v| v.is_nan())) {
             eprintln!("    [NaN source: dual-maestro Kerr-ODE output]");
         }
-
-        // 3. Output maestro (batched): squeeze + gelu + process
         let mae_out_sq = self.linear_batch(&weights.maestro_out.squeeze.w, &weights.maestro_out.squeeze.b, &kerr_outs);
         let mae_out_act: Vec<f32> = mae_out_sq.iter()
-            .flat_map(|v| v.iter().map(|&val| gelu_cpu(val)))
-            .collect();
+            .flat_map(|v| v.iter().map(|&val| gelu_cpu(val))).collect();
         let mae_out_act_vecs: Vec<Vec<f32>> = mae_out_act.chunks(maestro_dim).map(|c| c.to_vec()).collect();
         let mae_out_out = self.linear_batch(&weights.maestro_out.process_1.w, &weights.maestro_out.process_1.b, &mae_out_act_vecs);
-
-        // Regulate: kerr_out + maestro_out output
         let regulated: Vec<Vec<f32>> = (0..t).map(|pos| {
             let mut r = vec![0.0f32; n_embd];
             for i in 0..n_embd { r[i] = kerr_outs[pos][i] + mae_out_out[pos][i]; }
             r
         }).collect();
-
-        // 4. Output projection (batched)
         self.linear_batch(&weights.out_proj.w, &weights.out_proj.b, &regulated)
     }
 

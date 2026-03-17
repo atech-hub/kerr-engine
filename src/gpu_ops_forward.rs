@@ -282,6 +282,42 @@ impl GpuBackend {
         self.pool.lock().unwrap().readback_scratch(&self.device, &self.queue, 0, out_total)
     }
 
+    /// Batched matvec with resident weight buffers (no CPU→GPU upload for weights).
+    /// Only input activations (x) are uploaded per call.
+    pub(crate) fn gpu_matvec_batch_resident(
+        &self, w_buf: &wgpu::Buffer, b_buf: &wgpu::Buffer,
+        x_flat: &[f32], out_dim: usize, in_dim: usize, n_pos: usize, use_bias: bool,
+    ) -> Vec<f32> {
+        let use_bias_u32 = if use_bias { 1u32 } else { 0u32 };
+        let out_total = n_pos * out_dim;
+        let x_buf = self.storage_buf("x", x_flat);
+        {
+            let mut pool = self.pool.lock().unwrap();
+            pool.ensure_scratch(&self.device, 0, (out_total * 4) as u64);
+            let params = MatvecBatchParams { out_dim: out_dim as u32, in_dim: in_dim as u32, n_pos: n_pos as u32, use_bias: use_bias_u32 };
+            pool.write_uniform(&self.device, &self.queue, &params);
+        }
+        let pool = self.pool.lock().unwrap();
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None, layout: &self.matvec_batch_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: w_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: x_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: b_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: pool.scratch_ref(0).as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: pool.uniform_ref().as_entire_binding() },
+            ],
+        });
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        { let mut pass = encoder.begin_compute_pass(&Default::default());
+          pass.set_pipeline(&self.matvec_batch_pipeline);
+          pass.set_bind_group(0, &bind_group, &[]);
+          pass.dispatch_workgroups(out_dim as u32, n_pos as u32, 1); }
+        self.queue.submit(Some(encoder.finish()));
+        drop(pool);
+        self.pool.lock().unwrap().readback_scratch(&self.device, &self.queue, 0, out_total)
+    }
+
     /// Batched layer norm. Pooled scratch + staging.
     pub(crate) fn gpu_layer_norm_batch(&self, x_flat: &[f32], weight: &[f32], bias: &[f32], dim: usize, n_pos: usize) -> Vec<f32> {
         let out_total = n_pos * dim;

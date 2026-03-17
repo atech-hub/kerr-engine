@@ -780,6 +780,9 @@ impl ModelWeights {
         let n_embd = self.config.n_embd();
         let n_bands = self.config.n_bands;
 
+        // Reset FFN block counter for resident dispatch tracking
+        backend.reset_ffn_counter();
+
         // ─── Embedding: concatenate all batch sequences ─────────────
         let mut hidden: Vec<Vec<f32>> = Vec::with_capacity(total_pos);
         for b in 0..batch_size {
