@@ -71,7 +71,9 @@ fn kerr_derivative(@builtin(global_invocation_id) id: vec3<u32>) {
     let alpha = alpha_beta[0];
     let beta = alpha_beta[1];
 
-    let phi = omega[band] + alpha * mag_sq + beta * ns;
+    let mag_sq_c = min(mag_sq, 2500.0);
+    let ns_c = min(ns, 10000.0);
+    let phi = omega[band] + alpha * mag_sq_c + beta * ns_c;
     let g = gamma[band];
 
     dr_out[band] = -g * r - phi * s;

@@ -75,7 +75,21 @@ fn init_kerr_maestro_add(rng: &mut Rng, config: &ModelConfig) -> KerrMaestroAddW
     }
 }
 
+fn init_kerr_dual_maestro(rng: &mut Rng, config: &ModelConfig) -> KerrDualMaestroWeights {
+    let n_embd = config.n_embd();
+    KerrDualMaestroWeights {
+        kerr: init_kerr_weights(config),
+        maestro_in: init_maestro_weights(rng, n_embd, config.maestro_dim),
+        maestro_out: init_maestro_weights(rng, n_embd, config.maestro_dim),
+        out_proj: init_linear(rng, n_embd, n_embd),
+    }
+}
+
 pub fn init_model(vocab_size: usize, seed: u64, config: ModelConfig) -> ModelWeights {
+    init_model_ext(vocab_size, seed, config, false)
+}
+
+pub fn init_model_ext(vocab_size: usize, seed: u64, config: ModelConfig, dual_maestro: bool) -> ModelWeights {
     config.validate();
     let mut rng = Rng::new(seed);
     let n_embd = config.n_embd();
@@ -89,15 +103,19 @@ pub fn init_model(vocab_size: usize, seed: u64, config: ModelConfig) -> ModelWei
         ffn: FfnWeights::PerBand(init_per_band_linear(&mut rng, n_bands, n_embd)),
     };
 
-    // Blocks 1-(n_layers-1): KerrMaestroAdd
+    // Blocks 1-(n_layers-1): KerrMaestroAdd or KerrDualMaestro
+    // IMPORTANT: RNG consumption order must match original — attention before FFN.
     let mut blocks = vec![block0];
     for _ in 0..(config.n_layers - 1) {
-        blocks.push(BlockWeights {
-            ln_1: init_layer_norm(n_embd),
-            attn: init_attention(&mut rng, n_embd, config.n_head),
-            ln_2: init_layer_norm(n_embd),
-            ffn: FfnWeights::KerrMaestro(init_kerr_maestro_add(&mut rng, &config)),
-        });
+        let ln_1 = init_layer_norm(n_embd);
+        let attn = init_attention(&mut rng, n_embd, config.n_head);
+        let ln_2 = init_layer_norm(n_embd);
+        let ffn = if dual_maestro {
+            FfnWeights::KerrDualMaestro(init_kerr_dual_maestro(&mut rng, &config))
+        } else {
+            FfnWeights::KerrMaestro(init_kerr_maestro_add(&mut rng, &config))
+        };
+        blocks.push(BlockWeights { ln_1, attn, ln_2, ffn });
     }
 
     // LM head

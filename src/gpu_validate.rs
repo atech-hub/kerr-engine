@@ -105,6 +105,108 @@ pub fn validate_gpu_backend() {
         }
     }
 
+    // Test: Fused RK4 large (384 bands — exercises storage barrier path)
+    print!("  fused_rk4_large (384 bands, 4 pos)... ");
+    {
+        let n_bands = 384;
+        let n_pos = 4;
+        let n_embd = n_bands * 2;
+        let xs: Vec<Vec<f32>> = (0..n_pos).map(|pos| {
+            (0..n_embd).map(|i| ((pos * n_embd + i) as f32 * 0.003).sin()).collect()
+        }).collect();
+        let weights = KerrWeights {
+            gamma_raw: (0..n_bands).map(|k| -2.0 + k as f32 * 0.01).collect(),
+            omega: (0..n_bands).map(|k| k as f32 / n_bands as f32).collect(),
+            alpha: 0.1,
+            beta: 0.1,
+            rk4_n_steps: 16,
+        };
+
+        // CPU reference: use model.rs kerr_ode_forward per position
+        let cpu_outs: Vec<Vec<f32>> = {
+            let config = ModelConfig {
+                n_bands,
+                n_head: 12,
+                n_layers: 4,
+                maestro_dim: 16,
+                block_size: 256,
+                rk4_n_steps: 16,
+            };
+            let model = ModelWeights {
+                config,
+                vocab_size: 1,
+                wte_phase: vec![vec![0.0; n_embd]],
+                wpe: vec![vec![0.0; n_embd]],
+                blocks: vec![],
+                ln_f: LayerNormWeights { weight: vec![1.0; n_embd], bias: vec![0.0; n_embd] },
+                lm_head: vec![vec![0.0; n_embd]],
+            };
+            xs.iter().map(|x| model.kerr_ode_forward(&weights, x)).collect()
+        };
+
+        // GPU fused
+        let gpu_outs = gpu.gpu_kerr_ode_batch_fused(&weights, &xs);
+
+        let max_diff = cpu_outs.iter().zip(&gpu_outs)
+            .flat_map(|(c, g)| c.iter().zip(g.iter()).map(|(a, b)| (a - b).abs()))
+            .fold(0.0f32, f32::max);
+        if max_diff < 1e-4 {
+            println!("PASS (max_diff={max_diff:.2e})");
+        } else {
+            println!("FAIL (max_diff={max_diff:.2e})");
+        }
+    }
+
+    // Test: Fused RK4 large (64 bands — verify small band counts work too)
+    print!("  fused_rk4_large (64 bands, 4 pos)... ");
+    {
+        let n_bands = 64;
+        let n_pos = 4;
+        let n_embd = n_bands * 2;
+        let xs: Vec<Vec<f32>> = (0..n_pos).map(|pos| {
+            (0..n_embd).map(|i| ((pos * n_embd + i) as f32 * 0.01).sin()).collect()
+        }).collect();
+        let weights = KerrWeights {
+            gamma_raw: (0..n_bands).map(|k| -2.0 + k as f32 * 0.05).collect(),
+            omega: (0..n_bands).map(|k| k as f32 / n_bands as f32).collect(),
+            alpha: 0.1,
+            beta: 0.1,
+            rk4_n_steps: 8,
+        };
+
+        let cpu_outs: Vec<Vec<f32>> = {
+            let config = ModelConfig {
+                n_bands,
+                n_head: 4,
+                n_layers: 4,
+                maestro_dim: 16,
+                block_size: 256,
+                rk4_n_steps: 8,
+            };
+            let model = ModelWeights {
+                config,
+                vocab_size: 1,
+                wte_phase: vec![vec![0.0; n_embd]],
+                wpe: vec![vec![0.0; n_embd]],
+                blocks: vec![],
+                ln_f: LayerNormWeights { weight: vec![1.0; n_embd], bias: vec![0.0; n_embd] },
+                lm_head: vec![vec![0.0; n_embd]],
+            };
+            xs.iter().map(|x| model.kerr_ode_forward(&weights, x)).collect()
+        };
+
+        let gpu_outs = gpu.gpu_kerr_ode_batch_fused(&weights, &xs);
+
+        let max_diff = cpu_outs.iter().zip(&gpu_outs)
+            .flat_map(|(c, g)| c.iter().zip(g.iter()).map(|(a, b)| (a - b).abs()))
+            .fold(0.0f32, f32::max);
+        if max_diff < 1e-4 {
+            println!("PASS (max_diff={max_diff:.2e})");
+        } else {
+            println!("FAIL (max_diff={max_diff:.2e})");
+        }
+    }
+
     println!("\nGPU backend validation complete.");
 }
 

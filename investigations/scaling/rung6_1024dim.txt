@@ -1,0 +1,181 @@
+warning: unused import: `wgpu::util::DeviceExt`
+ --> src\gpu_pipelines.rs:7:5
+  |
+7 | use wgpu::util::DeviceExt;
+  |     ^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `crate::model::*`
+  --> src\gpu_pipelines.rs:11:5
+   |
+11 | use crate::model::*;
+   |     ^^^^^^^^^^^^^^^
+
+warning: unused import: `crate::init::init_model`
+  --> src\train.rs:11:5
+   |
+11 | use crate::init::init_model;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused variable: `queue`
+   --> src\gpu_buffers.rs:140:59
+    |
+140 |     pub fn cache_weight(&mut self, device: &wgpu::Device, queue: &wgpu::Queue,
+    |                                                           ^^^^^ help: if this is intentional, prefix it with an underscore: `_queue`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `kerr-engine` (lib) generated 4 warnings (run `cargo fix --lib -p kerr-engine` to apply 4 suggestions)
+warning: function `load_with_config` is never used
+  --> src\checkpoint.rs:74:8
+   |
+74 | pub fn load_with_config(path: &str, fallback: ModelConfig) -> io::Result<TrainingState> {
+   |        ^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `linear_backward` is never used
+  --> src\backward.rs:14:8
+   |
+14 | pub fn linear_backward(
+   |        ^^^^^^^^^^^^^^^
+
+warning: function `maestro_backward` is never used
+   --> src\backward.rs:519:8
+    |
+519 | pub fn maestro_backward(
+    |        ^^^^^^^^^^^^^^^^
+
+warning: struct `LinearGrads` is never constructed
+   --> src\backward.rs:550:12
+    |
+550 | pub struct LinearGrads {
+    |            ^^^^^^^^^^^
+
+warning: methods `cache_weight`, `has_weight`, `weight_ref`, and `cached_count` are never used
+   --> src\gpu_buffers.rs:140:12
+    |
+ 34 | impl GpuBufferPool {
+    | ------------------ methods in this implementation
+...
+140 |     pub fn cache_weight(&mut self, device: &wgpu::Device, queue: &wgpu::Queue,
+    |            ^^^^^^^^^^^^
+...
+153 |     pub fn has_weight(&self, source_ptr: usize) -> bool {
+    |            ^^^^^^^^^^
+...
+158 |     pub fn weight_ref(&self, source_ptr: usize) -> &wgpu::Buffer {
+    |            ^^^^^^^^^^
+...
+163 |     pub fn cached_count(&self) -> usize {
+    |            ^^^^^^^^^^^^
+
+warning: fields `matvec_bwd_pipeline` and `matvec_bwd_layout` are never read
+  --> src\gpu_pipelines.rs:28:16
+   |
+15 | pub struct GpuBackend {
+   |            ---------- fields in this struct
+...
+28 |     pub(crate) matvec_bwd_pipeline: wgpu::ComputePipeline,
+   |                ^^^^^^^^^^^^^^^^^^^
+29 |     pub(crate) matvec_bwd_layout: wgpu::BindGroupLayout,
+   |                ^^^^^^^^^^^^^^^^^
+
+warning: method `invalidate_weight_cache` is never used
+   --> src\gpu_pipelines.rs:702:12
+    |
+212 | impl GpuBackend {
+    | --------------- method in this implementation
+...
+702 |     pub fn invalidate_weight_cache(&self) {
+    |            ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: methods `kerr_maestro_add` and `extract_ode_states` are never used
+   --> src\model.rs:460:12
+    |
+264 | impl ModelWeights {
+    | ----------------- methods in this implementation
+...
+460 |     pub fn kerr_maestro_add(&self, weights: &KerrMaestroAddWeights, x: &[Vec<f32>]) -> Vec<Vec<f32>> {
+    |            ^^^^^^^^^^^^^^^^
+...
+597 |     pub fn extract_ode_states(
+    |            ^^^^^^^^^^^^^^^^^^
+
+warning: method `set_lr` is never used
+  --> src\optim.rs:21:12
+   |
+19 | impl Adam {
+   | --------- method in this implementation
+20 |     /// Set learning rate (for transition lr schedule).
+21 |     pub fn set_lr(&mut self, lr: f32) { self.lr = lr; }
+   |            ^^^^^^
+
+warning: method `lr_multiplier` is never used
+  --> src\train.rs:75:12
+   |
+27 | impl CurriculumSchedule {
+   | ----------------------- method in this implementation
+...
+75 |     pub fn lr_multiplier(&self, iter: usize, n_iters: usize, margin: usize) -> f32 {
+   |            ^^^^^^^^^^^^^
+
+warning: `kerr-engine` (bin "kerr-engine") generated 14 warnings (4 duplicates)
+    Finished `release` profile [optimized] target(s) in 0.09s
+     Running `target\release\kerr-engine.exe train data/input.txt 500 4 64 1e-4 --dual-maestro --n-bands 512 --n-head 16 --gpu --seed 42 --rk4-steps 16 --threads 4`
+kerr-engine v0.2.0
+
+Stage 4 — training from scratch
+
+Loading dataset from data/input.txt...
+  Dataset [char]: 1115394 tokens (train=1003854, val=111540), vocab_size=65
+Initializing model (seed=42, dual-maestro)...
+  Trainable parameters: 21285990
+  GPU: NVIDIA GeForce RTX 4070 Ti (Vulkan)
+  GPU adapter: NVIDIA GeForce RTX 4070 Ti
+  Backend:     Vulkan
+  Precision: tiled workgroup reduction (stable at 768-dim+)
+  Backend: GPU (n_embd=1024 >= 768 crossover)
+  Curriculum: 8 bands (0-100), 24 bands (100-225), 128 bands (225-350), 512 bands (350-500)
+
+Training for 500 iterations (batch_size=4, seq_len=64, lr=0.0001, threads=4)
+  Iter       Loss  Bands       Time
+----------------------------------------
+     0     4.2511      8       1.6s
+    50     3.2445      8       1.5s
+   100     3.1579     24       1.5s
+   150     2.7443     24       1.5s
+   200     2.6937     24       1.5s
+   250     2.5005    128       1.5s
+   300     2.9385    128       1.5s
+  [val_loss=2.6692]
+
+--- Sample (iter 300, 128 bands) ---
+e ;s l- sjdtc
+
+st:
+,
+f!S jsg??
+
+Jx
+'d'g,'&&q:- &r
+ZQw3F'&Q&&Q&3;&zXq&QQ&&&&QPq&&33&XJQ$FKx3!&Q&$&X&&qQF&3Z-&Tq$H&&$&QHZHV$3$&x''QQX3&&3&3&3;;$LxzQXj'3$P;-$Q&&3x&&33q.v$&!$3QQ$&&3$&33&Q3&VQ&&XF&&$-$&&x
+---
+
+   350     3.9760    512       1.7s
+   400     2.3924    512       1.6s
+   450     2.4791    512       1.7s
+   499     2.5891    512       1.6s
+
+Training complete. Total time: 838.7s
+  Final val_loss: 2.4735
+  [summary saved: training_summary.json]
+  [final checkpoint saved: checkpoint_final.bin]
+
+=== Final sample ===
+'h wave nthay leivest thanger prof nusat dungalnd cioverth arud blathisenthe ss,
+t ngheat npod mand be pieol sor Thooleruce eyold  t ondroproundf cr himas isk mefortheinceet! t o t beby  ghe ror handy, pavof sithor bourt t ntpomy t tor siseea y suse itheroneat t sthe deusachoreoimashin yeteretret won nder ithst.
+coomory, y.
+msethad tr cour Mariry thish thot dino ceatetusosere themathelaleeeeroincout nde d nden y, y id ithe cuseeeeelyoninathecand soust igr se wed isheivesty haveathins y yoarind t
+===

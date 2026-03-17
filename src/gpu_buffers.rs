@@ -16,7 +16,7 @@ use wgpu::util::DeviceExt;
 /// Buffer pool that caches GPU buffers for reuse across dispatches.
 pub struct GpuBufferPool {
     /// Weight/bias buffers cached by (data pointer, byte length).
-    data_cache: HashMap<(usize, usize), wgpu::Buffer>,
+    weight_cache: HashMap<usize, wgpu::Buffer>,
 
     /// Scratch output buffers by index (resized as needed per slot).
     scratch: Vec<Option<wgpu::Buffer>>,
@@ -34,28 +34,13 @@ pub struct GpuBufferPool {
 impl GpuBufferPool {
     pub fn new() -> Self {
         Self {
-            data_cache: HashMap::new(),
+            weight_cache: HashMap::new(),
             scratch: Vec::new(),
             scratch_sizes: Vec::new(),
             staging: None,
             staging_size: 0,
             uniform: None,
             uniform_size: 0,
-        }
-    }
-
-    // ─── Phase 1: Ensure buffers exist (mutable) ─────────────
-
-    /// Ensure a data buffer exists for this slice. Cached by pointer identity.
-    pub fn ensure_data(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, data: &[f32]) {
-        let key = (data.as_ptr() as usize, data.len() * 4);
-        if !self.data_cache.contains_key(&key) {
-            let buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: None,
-                contents: bytemuck::cast_slice(data),
-                usage: wgpu::BufferUsages::STORAGE,
-            });
-            self.data_cache.insert(key, buf);
         }
     }
 
@@ -91,14 +76,6 @@ impl GpuBufferPool {
             self.uniform_size = size.max(16);
         }
         queue.write_buffer(self.uniform.as_ref().unwrap(), 0, bytes);
-    }
-
-    // ─── Phase 2: Get buffer references (immutable) ──────────
-
-    /// Get reference to a cached data buffer.
-    pub fn data_ref(&self, data: &[f32]) -> &wgpu::Buffer {
-        let key = (data.as_ptr() as usize, data.len() * 4);
-        self.data_cache.get(&key).expect("data buffer not ensured")
     }
 
     /// Get reference to scratch output buffer at `slot`.
@@ -152,11 +129,38 @@ impl GpuBufferPool {
 
     /// Invalidate all cached data buffers. Call after optimizer step.
     pub fn invalidate_weights(&mut self) {
-        self.data_cache.clear();
+        self.weight_cache.clear();
     }
 
-    /// Number of cached data buffers (for diagnostics).
+    // ─── Weight buffer caching (block-change tracking) ────────
+
+    /// Cache a flattened weight buffer by source pointer.
+    /// The source pointer (from ModelWeights) is stable within an iteration.
+    /// Only re-upload after optimizer step invalidates the cache.
+    pub fn cache_weight(&mut self, device: &wgpu::Device, queue: &wgpu::Queue,
+                        source_ptr: usize, flat_data: &[f32]) {
+        if !self.weight_cache.contains_key(&source_ptr) {
+            let buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::cast_slice(flat_data),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+            self.weight_cache.insert(source_ptr, buf);
+        }
+    }
+
+    /// Check if a weight buffer is cached.
+    pub fn has_weight(&self, source_ptr: usize) -> bool {
+        self.weight_cache.contains_key(&source_ptr)
+    }
+
+    /// Get cached weight buffer reference.
+    pub fn weight_ref(&self, source_ptr: usize) -> &wgpu::Buffer {
+        self.weight_cache.get(&source_ptr).expect("weight not cached")
+    }
+
+    /// Number of cached weight buffers (for diagnostics).
     pub fn cached_count(&self) -> usize {
-        self.data_cache.len()
+        self.weight_cache.len()
     }
 }

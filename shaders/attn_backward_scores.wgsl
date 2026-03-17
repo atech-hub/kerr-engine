@@ -93,12 +93,17 @@ fn attn_backward_scores(
     workgroupBarrier();
 
     // --- Pass D: d_q[pos][offset+d] = sum_ki d_score[ki] * k[ki][offset+d] * scale ---
-    // Each thread handles one or more d values
+    // Kahan compensated summation
     var d_idx = tid;
     while (d_idx < hd) {
         var sum: f32 = 0.0;
+        var comp: f32 = 0.0;
         for (var k: u32 = 0u; k <= pos; k++) {
-            sum += d_score_buf[dscore_base + k] * k_all[k * n_embd + offset + d_idx];
+            let product = d_score_buf[dscore_base + k] * k_all[k * n_embd + offset + d_idx];
+            let y_val = product - comp;
+            let t = sum + y_val;
+            comp = (t - sum) - y_val;
+            sum = t;
         }
         d_q[pos * n_embd + offset + d_idx] = sum * scale;
         d_idx += WG_SIZE;

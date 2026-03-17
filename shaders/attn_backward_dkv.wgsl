@@ -37,16 +37,25 @@ fn attn_backward_dkv(@builtin(global_invocation_id) id: vec3<u32>) {
     let head = d_global / hd;
     let scale = 1.0 / sqrt(f32(hd));
 
+    // Kahan compensated summation
     var dk_sum: f32 = 0.0;
+    var dk_comp: f32 = 0.0;
     var dv_sum: f32 = 0.0;
+    var dv_comp: f32 = 0.0;
     for (var pos: u32 = ki; pos < T; pos++) {
-        // d_score_buf layout: [pos * n_head * T + head * T + ki]
         let d_score_val = d_score_buf[pos * n_head * T + head * T + ki];
-        dk_sum += d_score_val * q_all[pos * n_embd + d_global];
+        let dk_prod = d_score_val * q_all[pos * n_embd + d_global];
+        let dk_y = dk_prod - dk_comp;
+        let dk_t = dk_sum + dk_y;
+        dk_comp = (dk_t - dk_sum) - dk_y;
+        dk_sum = dk_t;
 
-        // att_weights layout: [head * T * T + pos * T + ki]
         let att_val = att_weights[head * T * T + pos * T + ki];
-        dv_sum += att_val * d_out[pos * n_embd + d_global];
+        let dv_prod = att_val * d_out[pos * n_embd + d_global];
+        let dv_y = dv_prod - dv_comp;
+        let dv_t = dv_sum + dv_y;
+        dv_comp = (dv_t - dv_sum) - dv_y;
+        dv_sum = dv_t;
     }
 
     d_k[ki * n_embd + d_global] = dk_sum * scale;

@@ -36,11 +36,17 @@ fn outer_product(
     }
 
     // Each thread handles columns j = tid, tid+WG_SIZE, tid+2*WG_SIZE, ...
+    // Kahan compensated summation
     var j = tid;
     while (j < in_dim) {
         var sum: f32 = 0.0;
+        var comp: f32 = 0.0;
         for (var pos: u32 = 0u; pos < n_pos; pos++) {
-            sum += d_y[pos * out_dim + i] * x[pos * in_dim + j];
+            let product = d_y[pos * out_dim + i] * x[pos * in_dim + j];
+            let y_val = product - comp;
+            let t = sum + y_val;
+            comp = (t - sum) - y_val;
+            sum = t;
         }
         d_w[i * in_dim + j] += sum;
         j += WG_SIZE;
@@ -49,8 +55,12 @@ fn outer_product(
     // Bias: one thread per row computes the sum
     if (params.compute_bias != 0u && tid == 0u) {
         var bias_sum: f32 = 0.0;
+        var bias_comp: f32 = 0.0;
         for (var pos: u32 = 0u; pos < n_pos; pos++) {
-            bias_sum += d_y[pos * out_dim + i];
+            let val = d_y[pos * out_dim + i] - bias_comp;
+            let t = bias_sum + val;
+            bias_comp = (t - bias_sum) - val;
+            bias_sum = t;
         }
         d_b[i] += bias_sum;
     }

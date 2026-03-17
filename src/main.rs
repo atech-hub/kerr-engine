@@ -20,6 +20,7 @@ mod gpu_backend;
 mod gpu_dispatch;
 mod gpu_pipelines;
 mod gpu_persistent;
+mod gpu_resident;
 mod gpu_validate;
 mod grad_test;
 mod init;
@@ -406,6 +407,7 @@ fn run_train(args: &[String]) {
     let word_level = args.iter().any(|a| a == "--word");
     let force_cpu = args.iter().any(|a| a == "--cpu");
     let force_gpu = args.iter().any(|a| a == "--gpu");
+    let dual_maestro = args.iter().any(|a| a == "--dual-maestro");
     let resume_path = args.iter()
         .position(|a| a == "--resume")
         .and_then(|i| args.get(i + 1))
@@ -504,6 +506,7 @@ fn run_train(args: &[String]) {
         force_gpu,
         gpu_device,
         model_config,
+        dual_maestro,
     });
 }
 

@@ -219,6 +219,17 @@ pub struct KerrMaestroAddWeights {
     pub out_proj: LinearWeights,
 }
 
+/// Weights for dual-maestro variant — pre-ODE regulator + post-ODE regulator.
+/// maestro_in normalises energy BEFORE the ODE (prevents energy spikes).
+/// maestro_out re-synchronises AFTER the ODE (corrects band imbalance).
+#[derive(Clone)]
+pub struct KerrDualMaestroWeights {
+    pub kerr: KerrWeights,
+    pub maestro_in: MaestroWeights,   // pre-ODE regulator
+    pub maestro_out: MaestroWeights,  // post-ODE regulator
+    pub out_proj: LinearWeights,
+}
+
 /// Weights for one Block.
 #[derive(Clone)]
 pub struct BlockWeights {
@@ -228,11 +239,13 @@ pub struct BlockWeights {
     pub ffn: FfnWeights,
 }
 
-/// FFN can be PerBandLinear (block 0) or KerrMaestroAdd (blocks 1-3).
+/// FFN can be PerBandLinear (block 0), KerrMaestroAdd (blocks 1-3),
+/// or KerrDualMaestro (blocks 1-3, high-dim stability variant).
 #[derive(Clone)]
 pub enum FfnWeights {
     PerBand(PerBandLinearWeights),
     KerrMaestro(KerrMaestroAddWeights),
+    KerrDualMaestro(KerrDualMaestroWeights),
 }
 
 /// Full model weights.
@@ -288,6 +301,12 @@ impl ModelWeights {
                     m
                 }
                 (FfnWeights::KerrMaestro(_), _) => { ode_layer += 1; None }
+                (FfnWeights::KerrDualMaestro(_), Some(offsets)) if ode_layer < offsets.len() => {
+                    let m = Some(offsets[ode_layer]);
+                    ode_layer += 1;
+                    m
+                }
+                (FfnWeights::KerrDualMaestro(_), _) => { ode_layer += 1; None }
                 _ => None, // PerBandLinear — no ODE, no memory
             };
             hidden = self.forward_block(block, &hidden, mem);
@@ -333,6 +352,7 @@ impl ModelWeights {
         let ffn_out = match &block.ffn {
             FfnWeights::PerBand(w) => self.per_band_linear(w, &normed_2),
             FfnWeights::KerrMaestro(w) => self.kerr_maestro_add_with_memory(w, &normed_2, memory),
+            FfnWeights::KerrDualMaestro(w) => self.kerr_dual_maestro_forward_with_memory(w, &normed_2, memory),
         };
         for i in 0..t {
             for j in 0..n_embd { h[i][j] += ffn_out[i][j]; }
@@ -465,6 +485,50 @@ impl ModelWeights {
             }
 
             let projected = linear(&weights.out_proj.w, &weights.out_proj.b, &combined);
+            result.push(projected);
+        }
+
+        result
+    }
+
+    /// Dual-maestro forward: maestro_in → ODE → maestro_out → out_proj.
+    /// Pre-ODE maestro normalises input energy. Post-ODE maestro re-synchronises.
+    pub fn kerr_dual_maestro_forward(
+        &self,
+        weights: &KerrDualMaestroWeights,
+        x: &[Vec<f32>],
+    ) -> Vec<Vec<f32>> {
+        self.kerr_dual_maestro_forward_with_memory(weights, x, None)
+    }
+
+    /// Dual-maestro forward with optional wave memory injection.
+    pub fn kerr_dual_maestro_forward_with_memory(
+        &self,
+        weights: &KerrDualMaestroWeights,
+        x: &[Vec<f32>],
+        memory: Option<(&[f32], &[f32])>,
+    ) -> Vec<Vec<f32>> {
+        let t = x.len();
+        let mut result = Vec::with_capacity(t);
+
+        for pos in 0..t {
+            let n_embd = x[pos].len();
+
+            // 1. Input maestro — regulates energy BEFORE ODE
+            let mae_in_out = self.maestro_forward(&weights.maestro_in, &x[pos]);
+            let mut precond = vec![0.0f32; n_embd];
+            for i in 0..n_embd { precond[i] = x[pos][i] + mae_in_out[i]; }
+
+            // 2. ODE runs on pre-conditioned input (with optional memory)
+            let kerr_out = self.kerr_ode_forward_with_memory(&weights.kerr, &precond, memory);
+
+            // 3. Output maestro — re-synchronises AFTER ODE
+            let mae_out_out = self.maestro_forward(&weights.maestro_out, &kerr_out);
+            let mut regulated = vec![0.0f32; n_embd];
+            for i in 0..n_embd { regulated[i] = kerr_out[i] + mae_out_out[i]; }
+
+            // 4. Output projection
+            let projected = linear(&weights.out_proj.w, &weights.out_proj.b, &regulated);
             result.push(projected);
         }
 
@@ -626,6 +690,64 @@ impl ModelWeights {
 
                     // Normal forward for hidden state propagation
                     let ffn_out = self.kerr_maestro_add_with_memory(w, &normed_2, mem);
+                    for i in 0..t {
+                        for j in 0..n_embd { h[i][j] += ffn_out[i][j]; }
+                    }
+
+                    ode_layer += 1;
+                }
+                FfnWeights::KerrDualMaestro(w) => {
+                    let mem = match memory_offsets {
+                        Some(offsets) if ode_layer < offsets.len() => Some(offsets[ode_layer]),
+                        _ => None,
+                    };
+
+                    // Extract ODE states: first apply maestro_in, then run ODE
+                    let mut avg_r = vec![0.0f32; n_bands];
+                    let mut avg_s = vec![0.0f32; n_bands];
+
+                    for pos in 0..t {
+                        // Apply maestro_in pre-conditioning
+                        let mae_in_out = self.maestro_forward(&w.maestro_in, &normed_2[pos]);
+                        let mut precond = vec![0.0f32; n_embd];
+                        for i in 0..n_embd { precond[i] = normed_2[pos][i] + mae_in_out[i]; }
+
+                        let mut r = vec![0.0f32; n_bands];
+                        let mut s = vec![0.0f32; n_bands];
+                        for k in 0..n_bands {
+                            r[k] = precond[k * 2];
+                            s[k] = precond[k * 2 + 1];
+                        }
+                        if let Some((r_mem, s_mem)) = mem {
+                            for k in 0..n_bands.min(r_mem.len()) {
+                                r[k] += r_mem[k];
+                                s[k] += s_mem[k];
+                            }
+                        }
+                        let gamma: Vec<f32> = w.kerr.gamma_raw.iter()
+                            .map(|&g| softplus(g)).collect();
+                        let n_steps = w.kerr.rk4_n_steps;
+                        let dt = 1.0 / n_steps as f32;
+                        for _ in 0..n_steps {
+                            let (r_new, s_new) = rk4_step(&r, &s, dt, &gamma,
+                                &w.kerr.omega, w.kerr.alpha, w.kerr.beta);
+                            r = r_new;
+                            s = s_new;
+                        }
+                        for k in 0..n_bands {
+                            avg_r[k] += r[k];
+                            avg_s[k] += s[k];
+                        }
+                    }
+
+                    let scale = 1.0 / t as f32;
+                    for k in 0..n_bands {
+                        avg_r[k] *= scale;
+                        avg_s[k] *= scale;
+                    }
+                    ode_states.push((avg_r, avg_s));
+
+                    let ffn_out = self.kerr_dual_maestro_forward_with_memory(w, &normed_2, mem);
                     for i in 0..t {
                         for j in 0..n_embd { h[i][j] += ffn_out[i][j]; }
                     }

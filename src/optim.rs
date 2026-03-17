@@ -17,6 +17,9 @@ pub struct Adam {
 }
 
 impl Adam {
+    /// Set learning rate (for transition lr schedule).
+    pub fn set_lr(&mut self, lr: f32) { self.lr = lr; }
+
     pub fn new(lr: f32, param_count: usize) -> Self {
         Self {
             lr,
@@ -136,6 +139,14 @@ pub fn count_params(model: &ModelWeights) -> usize {
                 n += n_embd * maestro_dim + n_embd; // process
                 n += n_embd * n_embd + n_embd; // out_proj
             }
+            FfnWeights::KerrDualMaestro(_) => {
+                n += n_bands + n_bands + 1 + 1; // gamma_raw, omega, alpha, beta
+                n += maestro_dim * n_embd + maestro_dim; // maestro_in squeeze
+                n += n_embd * maestro_dim + n_embd; // maestro_in process
+                n += maestro_dim * n_embd + maestro_dim; // maestro_out squeeze
+                n += n_embd * maestro_dim + n_embd; // maestro_out process
+                n += n_embd * n_embd + n_embd; // out_proj
+            }
         }
     }
 
@@ -183,6 +194,22 @@ pub fn flatten_params(model: &ModelWeights) -> Vec<f32> {
                 params.extend_from_slice(&w.maestro.squeeze.b);
                 for row in &w.maestro.process_1.w { params.extend_from_slice(row); }
                 params.extend_from_slice(&w.maestro.process_1.b);
+                for row in &w.out_proj.w { params.extend_from_slice(row); }
+                params.extend_from_slice(&w.out_proj.b);
+            }
+            FfnWeights::KerrDualMaestro(w) => {
+                params.extend_from_slice(&w.kerr.gamma_raw);
+                params.extend_from_slice(&w.kerr.omega);
+                params.push(w.kerr.alpha);
+                params.push(w.kerr.beta);
+                for row in &w.maestro_in.squeeze.w { params.extend_from_slice(row); }
+                params.extend_from_slice(&w.maestro_in.squeeze.b);
+                for row in &w.maestro_in.process_1.w { params.extend_from_slice(row); }
+                params.extend_from_slice(&w.maestro_in.process_1.b);
+                for row in &w.maestro_out.squeeze.w { params.extend_from_slice(row); }
+                params.extend_from_slice(&w.maestro_out.squeeze.b);
+                for row in &w.maestro_out.process_1.w { params.extend_from_slice(row); }
+                params.extend_from_slice(&w.maestro_out.process_1.b);
                 for row in &w.out_proj.w { params.extend_from_slice(row); }
                 params.extend_from_slice(&w.out_proj.b);
             }
@@ -235,6 +262,27 @@ pub fn flatten_grads(grads: &GradAccum) -> Vec<f32> {
                 flat.extend_from_slice(squeeze_b);
                 for row in process_w { flat.extend_from_slice(row); }
                 flat.extend_from_slice(process_b);
+                for row in out_proj_w { flat.extend_from_slice(row); }
+                flat.extend_from_slice(out_proj_b);
+            }
+            FfnGrads::KerrDualMaestro {
+                gamma_raw, omega, alpha, beta,
+                in_squeeze_w, in_squeeze_b, in_process_w, in_process_b,
+                out_squeeze_w, out_squeeze_b, out_process_w, out_process_b,
+                out_proj_w, out_proj_b,
+            } => {
+                flat.extend_from_slice(gamma_raw);
+                flat.extend_from_slice(omega);
+                flat.push(*alpha);
+                flat.push(*beta);
+                for row in in_squeeze_w { flat.extend_from_slice(row); }
+                flat.extend_from_slice(in_squeeze_b);
+                for row in in_process_w { flat.extend_from_slice(row); }
+                flat.extend_from_slice(in_process_b);
+                for row in out_squeeze_w { flat.extend_from_slice(row); }
+                flat.extend_from_slice(out_squeeze_b);
+                for row in out_process_w { flat.extend_from_slice(row); }
+                flat.extend_from_slice(out_process_b);
                 for row in out_proj_w { flat.extend_from_slice(row); }
                 flat.extend_from_slice(out_proj_b);
             }
@@ -297,6 +345,37 @@ pub fn unflatten_params(model: &mut ModelWeights, params: &[f32]) {
                     row.copy_from_slice(&params[idx..idx + maestro_dim]); idx += maestro_dim;
                 }
                 w.maestro.process_1.b.copy_from_slice(&params[idx..idx + n_embd]); idx += n_embd;
+                for row in &mut w.out_proj.w {
+                    row.copy_from_slice(&params[idx..idx + n_embd]); idx += n_embd;
+                }
+                w.out_proj.b.copy_from_slice(&params[idx..idx + n_embd]); idx += n_embd;
+            }
+            FfnWeights::KerrDualMaestro(w) => {
+                let n_bands = w.kerr.gamma_raw.len();
+                let maestro_dim = w.maestro_in.squeeze.b.len();
+                w.kerr.gamma_raw.copy_from_slice(&params[idx..idx + n_bands]); idx += n_bands;
+                w.kerr.omega.copy_from_slice(&params[idx..idx + n_bands]); idx += n_bands;
+                w.kerr.alpha = params[idx]; idx += 1;
+                w.kerr.beta = params[idx]; idx += 1;
+                // maestro_in
+                for row in &mut w.maestro_in.squeeze.w {
+                    row.copy_from_slice(&params[idx..idx + n_embd]); idx += n_embd;
+                }
+                w.maestro_in.squeeze.b.copy_from_slice(&params[idx..idx + maestro_dim]); idx += maestro_dim;
+                for row in &mut w.maestro_in.process_1.w {
+                    row.copy_from_slice(&params[idx..idx + maestro_dim]); idx += maestro_dim;
+                }
+                w.maestro_in.process_1.b.copy_from_slice(&params[idx..idx + n_embd]); idx += n_embd;
+                // maestro_out
+                for row in &mut w.maestro_out.squeeze.w {
+                    row.copy_from_slice(&params[idx..idx + n_embd]); idx += n_embd;
+                }
+                w.maestro_out.squeeze.b.copy_from_slice(&params[idx..idx + maestro_dim]); idx += maestro_dim;
+                for row in &mut w.maestro_out.process_1.w {
+                    row.copy_from_slice(&params[idx..idx + maestro_dim]); idx += maestro_dim;
+                }
+                w.maestro_out.process_1.b.copy_from_slice(&params[idx..idx + n_embd]); idx += n_embd;
+                // out_proj
                 for row in &mut w.out_proj.w {
                     row.copy_from_slice(&params[idx..idx + n_embd]); idx += n_embd;
                 }

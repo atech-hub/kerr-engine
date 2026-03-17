@@ -84,6 +84,12 @@ pub trait ComputeBackend {
     /// No-op for CPU backend. GPU backend clears its buffer cache.
     fn invalidate_weight_cache(&self) {}
 
+    /// Upload all model weights to GPU VRAM (no-op for CPU).
+    fn load_weights(&self, _model: &ModelWeights) {}
+
+    /// Write updated weights back to GPU after Adam step (no-op for CPU).
+    fn update_weights(&self, _model: &ModelWeights) {}
+
     /// Linear: y = W @ x + b
     fn linear(&self, w: &[Vec<f32>], b: &[f32], x: &[f32]) -> Vec<f32>;
 
@@ -96,6 +102,11 @@ pub trait ComputeBackend {
     /// Kerr-ODE forward: input [N_EMBD] → output [N_EMBD]
     fn kerr_ode(&self, weights: &KerrWeights, x: &[f32]) -> Vec<f32>;
 
+    /// Batched Kerr-ODE forward: [T][N_EMBD] → [T][N_EMBD]
+    fn kerr_ode_batch(&self, weights: &KerrWeights, xs: &[Vec<f32>]) -> Vec<Vec<f32>> {
+        xs.iter().map(|x| self.kerr_ode(weights, x)).collect()
+    }
+
     /// Maestro forward: input [N_EMBD] → output [N_EMBD]
     fn maestro(&self, weights: &MaestroWeights, x: &[f32]) -> Vec<f32>;
 
@@ -107,6 +118,9 @@ pub trait ComputeBackend {
 
     /// Kerr-Maestro-Add: [T][N_EMBD] → [T][N_EMBD]
     fn kerr_maestro_add(&self, weights: &KerrMaestroAddWeights, x: &[Vec<f32>]) -> Vec<Vec<f32>>;
+
+    /// Kerr-Dual-Maestro: maestro_in → ODE → maestro_out → out_proj
+    fn kerr_dual_maestro_add(&self, weights: &KerrDualMaestroWeights, x: &[Vec<f32>]) -> Vec<Vec<f32>>;
 
     /// Batched linear: y[i] = W @ x[i] + b for each x in the batch.
     /// Default loops over single linear(). Override for cache-efficient batching.
@@ -251,6 +265,10 @@ impl ComputeBackend for CpuBackend {
 
     fn kerr_maestro_add(&self, weights: &KerrMaestroAddWeights, x: &[Vec<f32>]) -> Vec<Vec<f32>> {
         kerr_maestro_add_cpu(weights, x)
+    }
+
+    fn kerr_dual_maestro_add(&self, weights: &KerrDualMaestroWeights, x: &[Vec<f32>]) -> Vec<Vec<f32>> {
+        kerr_dual_maestro_add_cpu(weights, x)
     }
 
     fn linear_batch(&self, w: &[Vec<f32>], b: &[f32], xs: &[Vec<f32>]) -> Vec<Vec<f32>> {
@@ -507,6 +525,33 @@ fn kerr_maestro_add_cpu(weights: &KerrMaestroAddWeights, x: &[Vec<f32>]) -> Vec<
             combined[i] = kerr_out[i] + maestro_out[i];
         }
         let projected = linear_fn(&weights.out_proj.w, &weights.out_proj.b, &combined);
+        result.push(projected);
+    }
+
+    result
+}
+
+fn kerr_dual_maestro_add_cpu(weights: &KerrDualMaestroWeights, x: &[Vec<f32>]) -> Vec<Vec<f32>> {
+    let t = x.len();
+    let n_embd = x[0].len();
+    let mut result = Vec::with_capacity(t);
+
+    for pos in 0..t {
+        // 1. Input maestro — pre-ODE energy regulation
+        let mae_in_out = maestro_cpu(&weights.maestro_in, &x[pos]);
+        let mut precond = vec![0.0f32; n_embd];
+        for i in 0..n_embd { precond[i] = x[pos][i] + mae_in_out[i]; }
+
+        // 2. ODE on pre-conditioned input
+        let kerr_out = kerr_ode_cpu(&weights.kerr, &precond);
+
+        // 3. Output maestro — post-ODE re-synchronisation
+        let mae_out_out = maestro_cpu(&weights.maestro_out, &kerr_out);
+        let mut regulated = vec![0.0f32; n_embd];
+        for i in 0..n_embd { regulated[i] = kerr_out[i] + mae_out_out[i]; }
+
+        // 4. Output projection
+        let projected = linear_fn(&weights.out_proj.w, &weights.out_proj.b, &regulated);
         result.push(projected);
     }
 

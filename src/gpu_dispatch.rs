@@ -14,6 +14,19 @@ impl ComputeBackend for GpuBackend {
         self.pool.lock().unwrap().invalidate_weights();
     }
 
+    fn load_weights(&self, model: &ModelWeights) {
+        let resident = crate::gpu_resident::ResidentWeightBuffers::from_model(
+            &self.device, &self.queue, model,
+        );
+        *self.resident.lock().unwrap() = Some(resident);
+    }
+
+    fn update_weights(&self, model: &ModelWeights) {
+        if let Some(ref resident) = *self.resident.lock().unwrap() {
+            resident.update_from_model(&self.queue, model);
+        }
+    }
+
     fn linear(&self, w: &[Vec<f32>], b: &[f32], x: &[f32]) -> Vec<f32> {
         let out_dim = w.len();
         let in_dim = if out_dim > 0 { w[0].len() } else { 0 };
@@ -41,6 +54,10 @@ impl ComputeBackend for GpuBackend {
 
     fn kerr_ode(&self, weights: &KerrWeights, x: &[f32]) -> Vec<f32> {
         self.gpu_kerr_ode(weights, x)
+    }
+
+    fn kerr_ode_batch(&self, weights: &KerrWeights, xs: &[Vec<f32>]) -> Vec<Vec<f32>> {
+        self.gpu_kerr_ode_batch_fused(weights, xs)
     }
 
     fn maestro(&self, weights: &MaestroWeights, x: &[f32]) -> Vec<f32> {
@@ -136,8 +153,13 @@ impl ComputeBackend for GpuBackend {
         let t = x.len();
         let n_embd = x[0].len();
 
-        // Batched Kerr-ODE: all positions in one dispatch sequence
-        let kerr_outs = self.gpu_kerr_ode_batch(&weights.kerr, x);
+        // Batched Kerr-ODE: fused path chains all dispatches in one encoder
+        let kerr_outs = self.gpu_kerr_ode_batch_fused(&weights.kerr, x);
+
+        // NaN detection: Kerr-ODE vs Maestro
+        if kerr_outs.iter().any(|h| h.iter().any(|v| v.is_nan())) {
+            eprintln!("    [NaN source: Kerr-ODE output]");
+        }
 
         // Batched maestro: squeeze(linear+gelu) → process(linear)
         let maestro_outs = self.linear_batch(&weights.maestro.squeeze.w, &weights.maestro.squeeze.b, x);
@@ -158,6 +180,52 @@ impl ComputeBackend for GpuBackend {
         }).collect();
 
         self.linear_batch(&weights.out_proj.w, &weights.out_proj.b, &combined)
+    }
+
+    fn kerr_dual_maestro_add(&self, weights: &KerrDualMaestroWeights, x: &[Vec<f32>]) -> Vec<Vec<f32>> {
+        let t = x.len();
+        let n_embd = x[0].len();
+
+        // 1. Input maestro (batched): squeeze + gelu + process
+        let mae_in_sq = self.linear_batch(&weights.maestro_in.squeeze.w, &weights.maestro_in.squeeze.b, x);
+        let mae_in_act: Vec<f32> = mae_in_sq.iter()
+            .flat_map(|v| v.iter().map(|&val| gelu_cpu(val)))
+            .collect();
+        let maestro_dim = weights.maestro_in.squeeze.w.len();
+        let mae_in_act_vecs: Vec<Vec<f32>> = mae_in_act.chunks(maestro_dim).map(|c| c.to_vec()).collect();
+        let mae_in_out = self.linear_batch(&weights.maestro_in.process_1.w, &weights.maestro_in.process_1.b, &mae_in_act_vecs);
+
+        // Precondition: x + maestro_in output
+        let precond: Vec<Vec<f32>> = (0..t).map(|pos| {
+            let mut p = vec![0.0f32; n_embd];
+            for i in 0..n_embd { p[i] = x[pos][i] + mae_in_out[pos][i]; }
+            p
+        }).collect();
+
+        // 2. Kerr-ODE on pre-conditioned input (fused GPU path)
+        let kerr_outs = self.gpu_kerr_ode_batch_fused(&weights.kerr, &precond);
+
+        if kerr_outs.iter().any(|h| h.iter().any(|v| v.is_nan())) {
+            eprintln!("    [NaN source: dual-maestro Kerr-ODE output]");
+        }
+
+        // 3. Output maestro (batched): squeeze + gelu + process
+        let mae_out_sq = self.linear_batch(&weights.maestro_out.squeeze.w, &weights.maestro_out.squeeze.b, &kerr_outs);
+        let mae_out_act: Vec<f32> = mae_out_sq.iter()
+            .flat_map(|v| v.iter().map(|&val| gelu_cpu(val)))
+            .collect();
+        let mae_out_act_vecs: Vec<Vec<f32>> = mae_out_act.chunks(maestro_dim).map(|c| c.to_vec()).collect();
+        let mae_out_out = self.linear_batch(&weights.maestro_out.process_1.w, &weights.maestro_out.process_1.b, &mae_out_act_vecs);
+
+        // Regulate: kerr_out + maestro_out output
+        let regulated: Vec<Vec<f32>> = (0..t).map(|pos| {
+            let mut r = vec![0.0f32; n_embd];
+            for i in 0..n_embd { r[i] = kerr_outs[pos][i] + mae_out_out[pos][i]; }
+            r
+        }).collect();
+
+        // 4. Output projection (batched)
+        self.linear_batch(&weights.out_proj.w, &weights.out_proj.b, &regulated)
     }
 
     fn linear_batch(&self, w: &[Vec<f32>], b: &[f32], xs: &[Vec<f32>]) -> Vec<Vec<f32>> {
@@ -237,8 +305,7 @@ impl ComputeBackend for GpuBackend {
             let mut pass = encoder.begin_compute_pass(&Default::default());
             pass.set_pipeline(&self.matvec_bwd_pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
-            let workgroups = (in_dim as u32 + 63) / 64;
-            pass.dispatch_workgroups(workgroups, 1, 1);
+            pass.dispatch_workgroups(in_dim as u32, 1, 1); // tiled: one workgroup per input element
         }
         self.queue.submit(Some(encoder.finish()));
 
@@ -349,8 +416,7 @@ impl ComputeBackend for GpuBackend {
             let mut pass = encoder.begin_compute_pass(&Default::default());
             pass.set_pipeline(&self.matvec_bwd_batch_pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
-            let total = (n_pos * in_dim) as u32;
-            pass.dispatch_workgroups((total + 63) / 64, 1, 1);
+            pass.dispatch_workgroups(in_dim as u32, n_pos as u32, 1); // tiled: (in_dim, n_pos)
         }
         self.queue.submit(Some(encoder.finish()));
 

@@ -31,10 +31,16 @@ fn matvec_backward_batch(@builtin(global_invocation_id) id: vec3<u32>) {
     }
 
     // d_x[pos][j] = sum_i W[i][j] * d_y[pos][i]  (W^T @ d_y)
+    // Kahan compensated summation
     var sum: f32 = 0.0;
+    var comp: f32 = 0.0;
     let dy_base = pos * out_dim;
     for (var i: u32 = 0u; i < out_dim; i++) {
-        sum += w[i * in_dim + j] * d_y[dy_base + i];
+        let product = w[i * in_dim + j] * d_y[dy_base + i];
+        let y_val = product - comp;
+        let t = sum + y_val;
+        comp = (t - sum) - y_val;
+        sum = t;
     }
     d_x[pos * in_dim + j] = sum;
 }

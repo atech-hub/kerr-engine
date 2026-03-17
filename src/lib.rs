@@ -20,6 +20,7 @@ pub mod gpu_backend;
 pub mod gpu_dispatch;
 pub mod gpu_pipelines;
 pub mod gpu_persistent;
+pub mod gpu_resident;
 pub mod gpu_validate;
 pub mod grad_test;
 pub mod train;

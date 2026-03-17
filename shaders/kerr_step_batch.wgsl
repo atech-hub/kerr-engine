@@ -66,7 +66,13 @@ fn kerr_derivative_batch(@builtin(global_invocation_id) id: vec3<u32>) {
     let alpha = alpha_beta[0];
     let beta = alpha_beta[1];
 
-    let phi = omega[band] + alpha * mag_sq + beta * ns;
+    // Clamp magnitude terms to prevent phi overflow at 768-dim+.
+    // GPU FP differences can cause |Z| to drift, making mag_sq/ns explode.
+    // Clamp at 2500 (50² — matches RK4 magnitude bound of 50.0).
+    let mag_sq_c = min(mag_sq, 2500.0);
+    let ns_c = min(ns, 10000.0);
+
+    let phi = omega[band] + alpha * mag_sq_c + beta * ns_c;
     let g = gamma[band];
 
     dr_out[base + band] = -g * r - phi * s;

@@ -27,8 +27,13 @@ fn matvec_backward(@builtin(global_invocation_id) id: vec3<u32>) {
     }
 
     var sum: f32 = 0.0;
+    var comp: f32 = 0.0;
     for (var i: u32 = 0u; i < params.out_dim; i++) {
-        sum += w[i * params.in_dim + j] * d_y[i];
+        let product = w[i * params.in_dim + j] * d_y[i];
+        let y_val = product - comp;
+        let t = sum + y_val;
+        comp = (t - sum) - y_val;
+        sum = t;
     }
 
     d_x[j] = sum;

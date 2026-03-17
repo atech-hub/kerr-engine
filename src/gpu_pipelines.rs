@@ -16,8 +16,9 @@ pub struct GpuBackend {
     pub(crate) device: wgpu::Device,
     pub(crate) queue: wgpu::Queue,
     /// Buffer pool for reusable GPU buffers (eliminates per-dispatch allocation).
-    /// RefCell for interior mutability — the ComputeBackend trait takes &self.
     pub(crate) pool: Mutex<GpuBufferPool>,
+    /// Resident weight buffers — uploaded once, updated after Adam step.
+    pub(crate) resident: Mutex<Option<crate::gpu_resident::ResidentWeightBuffers>>,
     pub(crate) matvec_pipeline: wgpu::ComputePipeline,
     pub(crate) matvec_layout: wgpu::BindGroupLayout,
     pub(crate) layer_norm_pipeline: wgpu::ComputePipeline,
@@ -56,6 +57,11 @@ pub struct GpuBackend {
     // Batched Kerr derivative backward: all positions in one dispatch
     pub(crate) kerr_bwd_batch_pipeline: wgpu::ComputePipeline,
     pub(crate) kerr_bwd_batch_layout: wgpu::BindGroupLayout,
+    // Fused RK4 utilities: vec_scale_add and rk4_combine for chained dispatch
+    pub(crate) vec_scale_add_pipeline: wgpu::ComputePipeline,
+    pub(crate) vec_scale_add_layout: wgpu::BindGroupLayout,
+    pub(crate) rk4_combine_pipeline: wgpu::ComputePipeline,
+    pub(crate) rk4_combine_layout: wgpu::BindGroupLayout,
 }
 
 // ─── Uniform param structs ──────────────────────────────────────
@@ -161,6 +167,24 @@ pub(crate) struct KerrDerivBatchParams {
 
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+pub(crate) struct VecScaleAddParams {
+    pub len: u32,
+    pub scale: f32,
+    pub _pad1: u32,
+    pub _pad2: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+pub(crate) struct Rk4CombineParams {
+    pub len: u32,
+    pub dt_over_6: f32,
+    pub _pad1: u32,
+    pub _pad2: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 pub(crate) struct KerrBwdBatchParams {
     pub n_bands: u32,
     pub n_pos: u32,
@@ -256,8 +280,11 @@ impl GpuBackend {
         ))
         .expect("Failed to get GPU device");
 
-        // ─── Compile matvec shader ──────────────────────────────
-        let matvec_src = include_str!("../shaders/matvec.wgsl");
+        // ─── Compile matvec shader (tiled workgroup reduction) ──────
+        // 64 threads per workgroup, each accumulates in_dim/64 terms,
+        // then tree-reduce. Error O(in_dim/64 + log2(64)) vs O(in_dim).
+        // One workgroup PER output row (dispatch = out_dim workgroups).
+        let matvec_src = include_str!("../shaders/matvec_tiled.wgsl");
         let matvec_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("matvec"),
             source: wgpu::ShaderSource::Wgsl(matvec_src.into()),
@@ -364,8 +391,8 @@ impl GpuBackend {
 
         // ─── Compile backward shaders ──────────────────────────────
 
-        // matvec_backward: d_x = W^T @ d_y
-        let mvb_src = include_str!("../shaders/matvec_backward.wgsl");
+        // matvec_backward: d_x = W^T @ d_y (tiled reduction)
+        let mvb_src = include_str!("../shaders/matvec_backward_tiled.wgsl");
         let mvb_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("matvec_backward"),
             source: wgpu::ShaderSource::Wgsl(mvb_src.into()),
@@ -524,7 +551,7 @@ impl GpuBackend {
         });
 
         // ─── Compile batched matvec backward shader ─────────────────
-        let mvbb_src = include_str!("../shaders/matvec_backward_batch.wgsl");
+        let mvbb_src = include_str!("../shaders/matvec_backward_batch_tiled.wgsl");
         let mvbb_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("matvec_backward_batch"),
             source: wgpu::ShaderSource::Wgsl(mvbb_src.into()),
@@ -548,8 +575,9 @@ impl GpuBackend {
             cache: None,
         });
 
-        // ─── Compile batched matvec forward shader ─────────────────
-        let mvb_fwd_src = include_str!("../shaders/matvec_batch.wgsl");
+        // ─── Compile batched matvec forward shader (tiled reduction) ──
+        println!("  Precision: tiled workgroup reduction (stable at 768-dim+)");
+        let mvb_fwd_src = include_str!("../shaders/matvec_batch_tiled.wgsl");
         let mvb_fwd_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("matvec_batch"),
             source: wgpu::ShaderSource::Wgsl(mvb_fwd_src.into()),
@@ -659,6 +687,54 @@ impl GpuBackend {
             cache: None,
         });
 
+        // ─── Compile vec_scale_add shader (y = a + scale * b) ───
+        let vsa_src = include_str!("../shaders/vec_scale_add.wgsl");
+        let vsa_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("vec_scale_add"),
+            source: wgpu::ShaderSource::Wgsl(vsa_src.into()),
+        });
+        let vec_scale_add_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("vec_scale_add_layout"),
+            entries: &[storage_ro(0), storage_ro(1), storage_rw(2), uniform_entry(3)],
+        });
+        let vsa_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("vec_scale_add_pl"),
+            bind_group_layouts: &[&vec_scale_add_layout],
+            push_constant_ranges: &[],
+        });
+        let vec_scale_add_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("vec_scale_add_pipeline"),
+            layout: Some(&vsa_pl),
+            module: &vsa_module,
+            entry_point: Some("vec_scale_add"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        // ─── Compile rk4_combine shader (y = base + dt/6*(k1 + 2*k2 + 2*k3 + k4)) ───
+        let rc_src = include_str!("../shaders/rk4_combine.wgsl");
+        let rc_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("rk4_combine"),
+            source: wgpu::ShaderSource::Wgsl(rc_src.into()),
+        });
+        let rk4_combine_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("rk4_combine_layout"),
+            entries: &[storage_ro(0), storage_ro(1), storage_ro(2), storage_ro(3), storage_ro(4), storage_rw(5), uniform_entry(6)],
+        });
+        let rc_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("rk4_combine_pl"),
+            bind_group_layouts: &[&rk4_combine_layout],
+            push_constant_ranges: &[],
+        });
+        let rk4_combine_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("rk4_combine_pipeline"),
+            layout: Some(&rc_pl),
+            module: &rc_module,
+            entry_point: Some("rk4_combine"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
         Self {
             device,
             queue,
@@ -690,7 +766,12 @@ impl GpuBackend {
             kerr_deriv_batch_layout,
             kerr_bwd_batch_pipeline,
             kerr_bwd_batch_layout,
+            vec_scale_add_pipeline,
+            vec_scale_add_layout,
+            rk4_combine_pipeline,
+            rk4_combine_layout,
             pool: Mutex::new(GpuBufferPool::new()),
+            resident: Mutex::new(None),
         }
     }
 

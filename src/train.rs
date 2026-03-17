@@ -32,6 +32,22 @@ impl CurriculumSchedule {
         }
     }
 
+    /// 4-stage schedule for high-dim GPU training.
+    /// Adds an intermediate stage at n_bands/4 to avoid the 16x energy jump
+    /// from 24 → full bands that triggers NaN on GPU at 768-dim+.
+    pub fn default_4stage(n_bands: usize) -> Self {
+        let s2 = 24.min(n_bands);
+        let s3 = (n_bands / 4).max(s2); // ~96 at 384 bands
+        Self {
+            stages: vec![
+                (8.min(n_bands), 0.20),
+                (s2,             0.25),
+                (s3,             0.25),
+                (n_bands,        0.30),
+            ],
+        }
+    }
+
     /// No curriculum — all bands from the start.
     #[allow(dead_code)]
     pub fn none(n_bands: usize) -> Self {
@@ -50,6 +66,22 @@ impl CurriculumSchedule {
             }
         }
         self.stages.last().unwrap().0
+    }
+
+    /// LR multiplier for GPU stability at transitions.
+    /// Returns 0.1 within `margin` iters of a band transition, 1.0 elsewhere.
+    /// The GPU FP drift accumulates proportional to lr — reducing lr at
+    /// transitions prevents the energy spike from amplifying accumulated drift.
+    pub fn lr_multiplier(&self, iter: usize, n_iters: usize, margin: usize) -> f32 {
+        let mut cumulative = 0.0f32;
+        for &(_bands, frac) in &self.stages[..self.stages.len().saturating_sub(1)] {
+            cumulative += frac;
+            let transition = (cumulative * n_iters as f32) as usize;
+            if iter + margin >= transition && iter <= transition + margin {
+                return 0.1;
+            }
+        }
+        1.0
     }
 
     /// Print schedule for logging.
@@ -87,6 +119,7 @@ pub struct TrainConfig {
     pub force_gpu: bool,
     pub gpu_device: Option<usize>,
     pub model_config: ModelConfig,
+    pub dual_maestro: bool,
 }
 
 // ─── Training loop ────────────────────────────────────────────
@@ -141,8 +174,9 @@ pub fn train_with_config(config: TrainConfig) {
         let rng = state.rng;
         (state.model, state.optimizer, rng, state.iter)
     } else {
-        println!("Initializing model (seed={})...", config.model_seed);
-        let model = init_model(dataset.vocab_size, config.model_seed, config.model_config);
+        println!("Initializing model (seed={}{})...", config.model_seed,
+            if config.dual_maestro { ", dual-maestro" } else { "" });
+        let model = crate::init::init_model_ext(dataset.vocab_size, config.model_seed, config.model_config, config.dual_maestro);
         let n_params = optim::count_params(&model);
         println!("  Trainable parameters: {}", n_params);
         let optimizer = Adam::new(config.lr, n_params);
@@ -153,6 +187,9 @@ pub fn train_with_config(config: TrainConfig) {
     // Select compute backend (CPU at 128-dim, GPU at larger scales)
     let compute_backend = backend::auto_select(config.model_config.n_embd(), config.force_cpu, config.force_gpu, config.gpu_device);
 
+    // Upload weights to GPU VRAM (no-op for CPU backend)
+    compute_backend.load_weights(&model);
+
     // Thread count: explicit or auto-detect (capped at batch_size)
     let n_threads = config.threads.unwrap_or_else(|| {
         thread::available_parallelism()
@@ -162,12 +199,14 @@ pub fn train_with_config(config: TrainConfig) {
 
     let n_params = optim::count_params(&model);
 
-    // Curriculum schedule
+    // Curriculum schedule — use 4-stage at high dims for GPU stability
     let n_bands = config.model_config.n_bands;
-    let curriculum = if config.use_curriculum {
-        CurriculumSchedule::default_3stage(n_bands)
-    } else {
+    let curriculum = if !config.use_curriculum {
         CurriculumSchedule::none(n_bands)
+    } else if n_bands > 64 {
+        CurriculumSchedule::default_4stage(n_bands)
+    } else {
+        CurriculumSchedule::default_3stage(n_bands)
     };
     print!("  Curriculum: ");
     curriculum.describe(config.n_iters);
@@ -196,36 +235,12 @@ pub fn train_with_config(config: TrainConfig) {
 
         let (inputs, targets) = dataset.sample_batch(&mut rng, config.batch_size, config.seq_len);
 
-        // Parallel forward+backward across batch elements
-        let batch_results: Vec<(f32, Vec<f32>)> = thread::scope(|s| {
-            let handles: Vec<_> = (0..config.batch_size).map(|b| {
-                let model_ref = &model;
-                let backend_ref = &*compute_backend;
-                let input_ref = &inputs[b];
-                let target_ref = &targets[b];
-                s.spawn(move || {
-                    let cache = model_ref.forward_with_cache_curriculum(input_ref, active_bands, backend_ref);
-                    let (loss, grads) = model_ref.backward(&cache, target_ref, backend_ref);
-                    let flat_grads = optim::flatten_grads(&grads);
-                    (loss, flat_grads)
-                })
-            }).collect();
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
-        });
-
-        // Reduce: sum losses and gradients
-        let mut total_loss = 0.0f32;
-        let mut grads = vec![0.0f32; n_params];
-        for (loss, fg) in &batch_results {
-            total_loss += loss;
-            for (a, g) in grads.iter_mut().zip(fg.iter()) {
-                *a += g;
-            }
-        }
-
-        // Average over batch
-        total_loss /= config.batch_size as f32;
-        for g in grads.iter_mut() { *g /= config.batch_size as f32; }
+        // Batched forward+backward: all batch elements in one pass for GPU efficiency.
+        // GPU ops process batch_size * seq_len positions per dispatch (4x more work).
+        // Attention is per-sequence internally (causal mask is sequence-local).
+        let (total_loss, mut grads) = model.forward_backward_batch(
+            &inputs, &targets, active_bands, &*compute_backend,
+        );
 
         // Gradient clipping
         optim::clip_grad_norm(&mut grads, 1.0);
@@ -236,7 +251,8 @@ pub fn train_with_config(config: TrainConfig) {
         optim::unflatten_params(&mut model, &params);
 
         // Invalidate GPU weight cache after weights change
-        compute_backend.invalidate_weight_cache();
+        // Write updated weights back to GPU VRAM (no-op for CPU)
+        compute_backend.update_weights(&model);
 
         let iter_time = iter_start.elapsed();
 
