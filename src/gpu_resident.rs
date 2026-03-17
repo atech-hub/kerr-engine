@@ -5,6 +5,66 @@
 
 use crate::model::*;
 
+/// Pre-allocated scratch buffers for the fused dual-maestro FFN chain.
+/// One set per block. Sized at from_model() time based on max_pos × n_embd.
+pub struct FfnScratch {
+    pub x_buf: wgpu::Buffer,          // input [n_pos * n_embd]
+    pub sq_buf: wgpu::Buffer,         // squeeze output [n_pos * maestro_dim]
+    pub act_buf: wgpu::Buffer,        // GELU output [n_pos * maestro_dim]
+    pub mae_out_buf: wgpu::Buffer,    // maestro process output [n_pos * n_embd]
+    pub precond_buf: wgpu::Buffer,    // x + maestro_in [n_pos * n_embd]
+    pub r_buf: wgpu::Buffer,          // deinterleaved r [n_pos * n_bands]
+    pub s_buf: wgpu::Buffer,          // deinterleaved s [n_pos * n_bands]
+    pub r_tmp: wgpu::Buffer,          // ODE scratch [n_pos * n_bands]
+    pub s_tmp: wgpu::Buffer,          // ODE scratch [n_pos * n_bands]
+    pub kerr_buf: wgpu::Buffer,       // reinterleaved ODE output [n_pos * n_embd]
+    pub sq2_buf: wgpu::Buffer,        // maestro_out squeeze [n_pos * maestro_dim]
+    pub act2_buf: wgpu::Buffer,       // maestro_out GELU [n_pos * maestro_dim]
+    pub mae_out2_buf: wgpu::Buffer,   // maestro_out process [n_pos * n_embd]
+    pub regulated_buf: wgpu::Buffer,  // kerr + maestro_out [n_pos * n_embd]
+    pub output_buf: wgpu::Buffer,     // final out_proj [n_pos * n_embd]
+    // RK4 scratch
+    pub k1r: wgpu::Buffer, pub k1s: wgpu::Buffer,
+    pub k2r: wgpu::Buffer, pub k2s: wgpu::Buffer,
+    pub k3r: wgpu::Buffer, pub k3s: wgpu::Buffer,
+    pub k4r: wgpu::Buffer, pub k4s: wgpu::Buffer,
+    pub r_mid: wgpu::Buffer, pub s_mid: wgpu::Buffer,
+    pub r_new: wgpu::Buffer, pub s_new: wgpu::Buffer,
+}
+
+impl FfnScratch {
+    pub fn new(device: &wgpu::Device, n_pos: usize, n_embd: usize, maestro_dim: usize) -> Self {
+        let n_bands = n_embd / 2;
+        let total_bands = n_pos * n_bands;
+        let make = |n: usize| device.create_buffer(&wgpu::BufferDescriptor {
+            label: None, size: (n * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        Self {
+            x_buf: make(n_pos * n_embd),
+            sq_buf: make(n_pos * maestro_dim),
+            act_buf: make(n_pos * maestro_dim),
+            mae_out_buf: make(n_pos * n_embd),
+            precond_buf: make(n_pos * n_embd),
+            r_buf: make(total_bands), s_buf: make(total_bands),
+            r_tmp: make(total_bands), s_tmp: make(total_bands),
+            kerr_buf: make(n_pos * n_embd),
+            sq2_buf: make(n_pos * maestro_dim),
+            act2_buf: make(n_pos * maestro_dim),
+            mae_out2_buf: make(n_pos * n_embd),
+            regulated_buf: make(n_pos * n_embd),
+            output_buf: make(n_pos * n_embd),
+            k1r: make(total_bands), k1s: make(total_bands),
+            k2r: make(total_bands), k2s: make(total_bands),
+            k3r: make(total_bands), k3s: make(total_bands),
+            k4r: make(total_bands), k4s: make(total_bands),
+            r_mid: make(total_bands), s_mid: make(total_bands),
+            r_new: make(total_bands), s_new: make(total_bands),
+        }
+    }
+}
+
 /// All model weights resident in GPU VRAM.
 pub struct ResidentWeightBuffers {
     // Per-block attention weights [n_layers]
@@ -21,6 +81,9 @@ pub struct ResidentWeightBuffers {
 
     // Per-block FFN — stored per block, layout depends on FFN type
     pub ffn_buffers: Vec<FfnResidentBuffers>,
+
+    // Pre-allocated scratch buffers for fused FFN chain (one per block)
+    pub ffn_scratch: Vec<FfnScratch>,
 
     // Final layer norm + LM head
     pub ln_f_w: wgpu::Buffer,
@@ -85,7 +148,10 @@ fn softplus(x: f32) -> f32 {
 
 impl ResidentWeightBuffers {
     /// Upload all model weights to GPU VRAM.
+    /// Upload all model weights to GPU VRAM and pre-allocate scratch buffers.
+    /// `max_pos` is the maximum number of positions per dispatch (batch_size * seq_len).
     pub fn from_model(device: &wgpu::Device, queue: &wgpu::Queue, model: &ModelWeights) -> Self {
+        let max_pos = 256; // batch_size(4) * seq_len(64) — covers the batched forward path
         let mut c_attn_w = Vec::new();
         let mut c_attn_b = Vec::new();
         let mut c_proj_w = Vec::new();
@@ -155,10 +221,26 @@ impl ResidentWeightBuffers {
             ffn_buffers.push(ffn);
         }
 
+        // Pre-allocate scratch buffers for fused FFN chain
+        let n_embd = model.config.n_embd();
+        let maestro_dim = model.config.maestro_dim;
+        let ffn_scratch: Vec<FfnScratch> = model.blocks.iter().map(|block| {
+            match &block.ffn {
+                FfnWeights::KerrDualMaestro(_) | FfnWeights::KerrMaestro(_) => {
+                    FfnScratch::new(device, max_pos, n_embd, maestro_dim)
+                }
+                FfnWeights::PerBand(_) => {
+                    // PerBand doesn't use the fused chain, allocate minimal
+                    FfnScratch::new(device, max_pos, n_embd, maestro_dim)
+                }
+            }
+        }).collect();
+
         Self {
             c_attn_w, c_attn_b, c_proj_w, c_proj_b,
             ln1_w, ln1_b, ln2_w, ln2_b,
             ffn_buffers,
+            ffn_scratch,
             ln_f_w: create_buf(device, queue, &model.ln_f.weight),
             ln_f_b: create_buf(device, queue, &model.ln_f.bias),
             lm_head: create_buf(device, queue, &flatten_weights(&model.lm_head)),

@@ -250,8 +250,10 @@ pub fn train_with_config(config: TrainConfig) {
         optimizer.step(&mut params, &grads);
         optim::unflatten_params(&mut model, &params);
 
-        // Invalidate GPU weight cache after weights change
-        // Write updated weights back to GPU VRAM (no-op for CPU)
+        // Two-system weight update:
+        // 1. Pool cache invalidation — forces re-upload on next access for attention, LN, LM head
+        // 2. Resident buffer update — writes FFN weights back for fused chain
+        compute_backend.invalidate_weight_cache();
         compute_backend.update_weights(&model);
 
         let iter_time = iter_start.elapsed();

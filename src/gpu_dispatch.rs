@@ -6,6 +6,7 @@
 use crate::backend::ComputeBackend;
 use crate::gpu_pipelines::*;
 use crate::model::*;
+use wgpu::util::DeviceExt;
 
 // ─── ComputeBackend implementation ──────────────────────────────
 
@@ -206,46 +207,301 @@ impl ComputeBackend for GpuBackend {
             y_flat.chunks(out_dim).map(|c| c.to_vec()).collect()
         };
 
-        // Use resident buffers for this block if available
+        // Fully fused on-GPU chain: all activations stay as GPU buffers.
+        // ONE upload (input x), all intermediate ops on GPU, ONE readback (final output).
         if let Some(ref res) = *resident {
             if let Some(crate::gpu_resident::FfnResidentBuffers::KerrDualMaestro {
-                    gamma: _, omega: _, alpha_beta: _,
+                    gamma, omega, alpha_beta: _,
                     in_squeeze_w, in_squeeze_b, in_process_w, in_process_b,
                     out_squeeze_w, out_squeeze_b, out_process_w, out_process_b,
                     out_proj_w, out_proj_b,
                 }) = res.ffn_buffers.get(block_idx) {
-                    // Use resident buffers for all linear ops
-                    // 1. Input maestro
-                    let mae_in_sq = linear_batch_res(in_squeeze_w, in_squeeze_b, x, maestro_dim, n_embd);
-                    let mae_in_act: Vec<f32> = mae_in_sq.iter()
-                        .flat_map(|v| v.iter().map(|&val| gelu_cpu(val))).collect();
-                    let mae_in_act_vecs: Vec<Vec<f32>> = mae_in_act.chunks(maestro_dim).map(|c| c.to_vec()).collect();
-                    let mae_in_out = linear_batch_res(in_process_w, in_process_b, &mae_in_act_vecs, n_embd, maestro_dim);
 
-                    let precond: Vec<Vec<f32>> = (0..t).map(|pos| {
-                        let mut p = vec![0.0f32; n_embd];
-                        for i in 0..n_embd { p[i] = x[pos][i] + mae_in_out[pos][i]; }
-                        p
-                    }).collect();
+                    let n_bands = n_embd / 2;
+                    let n_pos = t;
+                    let n_steps = weights.kerr.rk4_n_steps;
+                    let dt = 1.0 / n_steps as f32;
+                    let total_bands = n_pos * n_bands;
 
-                    // 2. ODE — uses fused batched path
-                    let kerr_outs = self.gpu_kerr_ode_batch_fused(&weights.kerr, &precond);
+                    // Upload input to pre-allocated scratch buffer (only PCIe transfer per call)
+                    let x_flat: Vec<f32> = x.iter().flat_map(|v| v.iter().copied()).collect();
+                    let sc = &res.ffn_scratch[block_idx];
+                    self.queue.write_buffer(&sc.x_buf, 0, bytemuck::cast_slice(&x_flat));
 
-                    // 3. Output maestro
-                    let mae_out_sq = linear_batch_res(out_squeeze_w, out_squeeze_b, &kerr_outs, maestro_dim, n_embd);
-                    let mae_out_act: Vec<f32> = mae_out_sq.iter()
-                        .flat_map(|v| v.iter().map(|&val| gelu_cpu(val))).collect();
-                    let mae_out_act_vecs: Vec<Vec<f32>> = mae_out_act.chunks(maestro_dim).map(|c| c.to_vec()).collect();
-                    let mae_out_out = linear_batch_res(out_process_w, out_process_b, &mae_out_act_vecs, n_embd, maestro_dim);
+                    // All scratch buffers are pre-allocated — zero allocations during training
+                    let x_buf = &sc.x_buf;
+                    let sq_buf = &sc.sq_buf;
+                    let act_buf = &sc.act_buf;
+                    let mae_out_buf = &sc.mae_out_buf;
+                    let precond_buf = &sc.precond_buf;
+                    let r_buf = &sc.r_buf;
+                    let s_buf = &sc.s_buf;
+                    let r_tmp = &sc.r_tmp;
+                    let s_tmp = &sc.s_tmp;
+                    let kerr_buf = &sc.kerr_buf;
+                    let sq2_buf = &sc.sq2_buf;
+                    let act2_buf = &sc.act2_buf;
+                    let mae_out2_buf = &sc.mae_out2_buf;
+                    let regulated_buf = &sc.regulated_buf;
+                    let output_buf = &sc.output_buf;
+                    let k1r = &sc.k1r; let k1s = &sc.k1s;
+                    let k2r = &sc.k2r; let k2s = &sc.k2s;
+                    let k3r = &sc.k3r; let k3s = &sc.k3s;
+                    let k4r = &sc.k4r; let k4s = &sc.k4s;
+                    let r_mid = &sc.r_mid; let s_mid = &sc.s_mid;
+                    let r_new = &sc.r_new; let s_new = &sc.s_new;
 
-                    let regulated: Vec<Vec<f32>> = (0..t).map(|pos| {
-                        let mut r = vec![0.0f32; n_embd];
-                        for i in 0..n_embd { r[i] = kerr_outs[pos][i] + mae_out_out[pos][i]; }
-                        r
-                    }).collect();
+                    // Uniform params
+                    let mv_sq_params = MatvecBatchParams { out_dim: maestro_dim as u32, in_dim: n_embd as u32, n_pos: n_pos as u32, use_bias: 1 };
+                    let mv_sq_u = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: None, contents: bytemuck::bytes_of(&mv_sq_params), usage: wgpu::BufferUsages::UNIFORM,
+                    });
+                    let mv_pr_params = MatvecBatchParams { out_dim: n_embd as u32, in_dim: maestro_dim as u32, n_pos: n_pos as u32, use_bias: 1 };
+                    let mv_pr_u = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: None, contents: bytemuck::bytes_of(&mv_pr_params), usage: wgpu::BufferUsages::UNIFORM,
+                    });
+                    let mv_out_params = MatvecBatchParams { out_dim: n_embd as u32, in_dim: n_embd as u32, n_pos: n_pos as u32, use_bias: 1 };
+                    let mv_out_u = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: None, contents: bytemuck::bytes_of(&mv_out_params), usage: wgpu::BufferUsages::UNIFORM,
+                    });
+                    let gelu_params = GeluParams { len: (n_pos * maestro_dim) as u32, _pad1: 0, _pad2: 0, _pad3: 0 };
+                    let gelu_u = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: None, contents: bytemuck::bytes_of(&gelu_params), usage: wgpu::BufferUsages::UNIFORM,
+                    });
+                    let va_params = VecAddParams { len: (n_pos * n_embd) as u32, _pad1: 0, _pad2: 0, _pad3: 0 };
+                    let va_u = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: None, contents: bytemuck::bytes_of(&va_params), usage: wgpu::BufferUsages::UNIFORM,
+                    });
+                    let di_params = DeinterleaveParams { n_bands: n_bands as u32, n_pos: n_pos as u32, _pad1: 0, _pad2: 0 };
+                    let di_u = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: None, contents: bytemuck::bytes_of(&di_params), usage: wgpu::BufferUsages::UNIFORM,
+                    });
+                    // Kerr derivative params
+                    let kd_params = KerrDerivBatchParams { n_bands: n_bands as u32, n_pos: n_pos as u32, _pad1: 0, _pad2: 0 };
+                    let kd_u = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: None, contents: bytemuck::bytes_of(&kd_params), usage: wgpu::BufferUsages::UNIFORM,
+                    });
+                    let ab = [weights.kerr.alpha, weights.kerr.beta];
+                    let ab_buf = self.storage_buf("ab", &ab);
+                    // RK4 scale params
+                    let vsa_half = VecScaleAddParams { len: total_bands as u32, scale: 0.5 * dt, _pad1: 0, _pad2: 0 };
+                    let vsa_half_u = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: None, contents: bytemuck::bytes_of(&vsa_half), usage: wgpu::BufferUsages::UNIFORM,
+                    });
+                    let vsa_full = VecScaleAddParams { len: total_bands as u32, scale: dt, _pad1: 0, _pad2: 0 };
+                    let vsa_full_u = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: None, contents: bytemuck::bytes_of(&vsa_full), usage: wgpu::BufferUsages::UNIFORM,
+                    });
+                    let rc_params = Rk4CombineParams { len: total_bands as u32, dt_over_6: dt / 6.0, _pad1: 0, _pad2: 0 };
+                    let rc_u = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: None, contents: bytemuck::bytes_of(&rc_params), usage: wgpu::BufferUsages::UNIFORM,
+                    });
 
-                    // 4. Output projection
-                    return linear_batch_res(out_proj_w, out_proj_b, &regulated, n_embd, n_embd);
+                    let wg_maestro = ((n_pos * maestro_dim) as u32 + 63) / 64;
+                    let wg_embd = ((n_pos * n_embd) as u32 + 63) / 64;
+                    let wg_bands = (total_bands as u32 + 63) / 64;
+
+                    // ═══ Build ONE command encoder for the entire FFN ═══
+                    let mut enc = self.device.create_command_encoder(&Default::default());
+
+                    // 1. Maestro_in squeeze: x → sq_buf  (matvec: [maestro_dim, n_embd] @ x)
+                    { let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &self.matvec_batch_layout, entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: in_squeeze_w.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 1, resource: x_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 2, resource: in_squeeze_b.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 3, resource: sq_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 4, resource: mv_sq_u.as_entire_binding() },
+                    ]});
+                    let mut p = enc.begin_compute_pass(&Default::default());
+                    p.set_pipeline(&self.matvec_batch_pipeline); p.set_bind_group(0, &bg, &[]);
+                    p.dispatch_workgroups(maestro_dim as u32, n_pos as u32, 1); }
+
+                    // 2. GELU: sq_buf → act_buf
+                    { let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &self.gelu_layout, entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: sq_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 1, resource: act_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 2, resource: gelu_u.as_entire_binding() },
+                    ]});
+                    let mut p = enc.begin_compute_pass(&Default::default());
+                    p.set_pipeline(&self.gelu_pipeline); p.set_bind_group(0, &bg, &[]);
+                    p.dispatch_workgroups(wg_maestro, 1, 1); }
+
+                    // 3. Maestro_in process: act_buf → mae_out_buf (matvec: [n_embd, maestro_dim] @ act)
+                    { let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &self.matvec_batch_layout, entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: in_process_w.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 1, resource: act_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 2, resource: in_process_b.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 3, resource: mae_out_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 4, resource: mv_pr_u.as_entire_binding() },
+                    ]});
+                    let mut p = enc.begin_compute_pass(&Default::default());
+                    p.set_pipeline(&self.matvec_batch_pipeline); p.set_bind_group(0, &bg, &[]);
+                    p.dispatch_workgroups(n_embd as u32, n_pos as u32, 1); }
+
+                    // 4. Vec add: x + mae_out → precond_buf
+                    { let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &self.vec_add_layout, entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: x_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 1, resource: mae_out_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 2, resource: precond_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 3, resource: va_u.as_entire_binding() },
+                    ]});
+                    let mut p = enc.begin_compute_pass(&Default::default());
+                    p.set_pipeline(&self.vec_add_pipeline); p.set_bind_group(0, &bg, &[]);
+                    p.dispatch_workgroups(wg_embd, 1, 1); }
+
+                    // 5. Deinterleave: precond_buf → r_buf, s_buf
+                    { let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &self.deinterleave_layout, entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: precond_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 1, resource: r_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 2, resource: s_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 3, resource: di_u.as_entire_binding() },
+                    ]});
+                    let mut p = enc.begin_compute_pass(&Default::default());
+                    p.set_pipeline(&self.deinterleave_pipeline); p.set_bind_group(0, &bg, &[]);
+                    p.dispatch_workgroups(wg_bands, 1, 1); }
+
+                    // 6. Fused RK4 ODE (all n_steps in this encoder)
+                    // Pre-create bind groups for ODE chain
+                    let deriv_bg = |r_in: &wgpu::Buffer, s_in: &wgpu::Buffer, dr: &wgpu::Buffer, ds: &wgpu::Buffer| {
+                        self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &self.kerr_deriv_batch_layout, entries: &[
+                            wgpu::BindGroupEntry { binding: 0, resource: r_in.as_entire_binding() },
+                            wgpu::BindGroupEntry { binding: 1, resource: s_in.as_entire_binding() },
+                            wgpu::BindGroupEntry { binding: 2, resource: dr.as_entire_binding() },
+                            wgpu::BindGroupEntry { binding: 3, resource: ds.as_entire_binding() },
+                            wgpu::BindGroupEntry { binding: 4, resource: gamma.as_entire_binding() },
+                            wgpu::BindGroupEntry { binding: 5, resource: omega.as_entire_binding() },
+                            wgpu::BindGroupEntry { binding: 6, resource: kd_u.as_entire_binding() },
+                            wgpu::BindGroupEntry { binding: 7, resource: ab_buf.as_entire_binding() },
+                        ]})
+                    };
+                    let vsa_bg = |a: &wgpu::Buffer, b: &wgpu::Buffer, y: &wgpu::Buffer, u: &wgpu::Buffer| {
+                        self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &self.vec_scale_add_layout, entries: &[
+                            wgpu::BindGroupEntry { binding: 0, resource: a.as_entire_binding() },
+                            wgpu::BindGroupEntry { binding: 1, resource: b.as_entire_binding() },
+                            wgpu::BindGroupEntry { binding: 2, resource: y.as_entire_binding() },
+                            wgpu::BindGroupEntry { binding: 3, resource: u.as_entire_binding() },
+                        ]})
+                    };
+                    let bg_k1 = deriv_bg(&r_buf, &s_buf, &k1r, &k1s);
+                    let bg_mid_r2 = vsa_bg(&r_buf, &k1r, &r_mid, &vsa_half_u);
+                    let bg_mid_s2 = vsa_bg(&s_buf, &k1s, &s_mid, &vsa_half_u);
+                    let bg_k2 = deriv_bg(&r_mid, &s_mid, &k2r, &k2s);
+                    let bg_mid_r3 = vsa_bg(&r_buf, &k2r, &r_mid, &vsa_half_u);
+                    let bg_mid_s3 = vsa_bg(&s_buf, &k2s, &s_mid, &vsa_half_u);
+                    let bg_k3 = deriv_bg(&r_mid, &s_mid, &k3r, &k3s);
+                    let bg_mid_r4 = vsa_bg(&r_buf, &k3r, &r_mid, &vsa_full_u);
+                    let bg_mid_s4 = vsa_bg(&s_buf, &k3s, &s_mid, &vsa_full_u);
+                    let bg_k4 = deriv_bg(&r_mid, &s_mid, &k4r, &k4s);
+                    let bg_comb_r = self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &self.rk4_combine_layout, entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: r_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 1, resource: k1r.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 2, resource: k2r.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 3, resource: k3r.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 4, resource: k4r.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 5, resource: r_new.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 6, resource: rc_u.as_entire_binding() },
+                    ]});
+                    let bg_comb_s = self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &self.rk4_combine_layout, entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: s_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 1, resource: k1s.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 2, resource: k2s.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 3, resource: k3s.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 4, resource: k4s.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 5, resource: s_new.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 6, resource: rc_u.as_entire_binding() },
+                    ]});
+
+                    let buf_size = (total_bands * 4) as u64;
+                    for _ in 0..n_steps {
+                        // k1, midpoints, k2, midpoints, k3, midpoints, k4, combine
+                        { let mut p = enc.begin_compute_pass(&Default::default()); p.set_pipeline(&self.kerr_deriv_batch_pipeline); p.set_bind_group(0, &bg_k1, &[]); p.dispatch_workgroups(wg_bands, 1, 1); }
+                        { let mut p = enc.begin_compute_pass(&Default::default()); p.set_pipeline(&self.vec_scale_add_pipeline); p.set_bind_group(0, &bg_mid_r2, &[]); p.dispatch_workgroups(wg_bands, 1, 1); }
+                        { let mut p = enc.begin_compute_pass(&Default::default()); p.set_pipeline(&self.vec_scale_add_pipeline); p.set_bind_group(0, &bg_mid_s2, &[]); p.dispatch_workgroups(wg_bands, 1, 1); }
+                        { let mut p = enc.begin_compute_pass(&Default::default()); p.set_pipeline(&self.kerr_deriv_batch_pipeline); p.set_bind_group(0, &bg_k2, &[]); p.dispatch_workgroups(wg_bands, 1, 1); }
+                        { let mut p = enc.begin_compute_pass(&Default::default()); p.set_pipeline(&self.vec_scale_add_pipeline); p.set_bind_group(0, &bg_mid_r3, &[]); p.dispatch_workgroups(wg_bands, 1, 1); }
+                        { let mut p = enc.begin_compute_pass(&Default::default()); p.set_pipeline(&self.vec_scale_add_pipeline); p.set_bind_group(0, &bg_mid_s3, &[]); p.dispatch_workgroups(wg_bands, 1, 1); }
+                        { let mut p = enc.begin_compute_pass(&Default::default()); p.set_pipeline(&self.kerr_deriv_batch_pipeline); p.set_bind_group(0, &bg_k3, &[]); p.dispatch_workgroups(wg_bands, 1, 1); }
+                        { let mut p = enc.begin_compute_pass(&Default::default()); p.set_pipeline(&self.vec_scale_add_pipeline); p.set_bind_group(0, &bg_mid_r4, &[]); p.dispatch_workgroups(wg_bands, 1, 1); }
+                        { let mut p = enc.begin_compute_pass(&Default::default()); p.set_pipeline(&self.vec_scale_add_pipeline); p.set_bind_group(0, &bg_mid_s4, &[]); p.dispatch_workgroups(wg_bands, 1, 1); }
+                        { let mut p = enc.begin_compute_pass(&Default::default()); p.set_pipeline(&self.kerr_deriv_batch_pipeline); p.set_bind_group(0, &bg_k4, &[]); p.dispatch_workgroups(wg_bands, 1, 1); }
+                        { let mut p = enc.begin_compute_pass(&Default::default()); p.set_pipeline(&self.rk4_combine_pipeline); p.set_bind_group(0, &bg_comb_r, &[]); p.dispatch_workgroups(wg_bands, 1, 1); }
+                        { let mut p = enc.begin_compute_pass(&Default::default()); p.set_pipeline(&self.rk4_combine_pipeline); p.set_bind_group(0, &bg_comb_s, &[]); p.dispatch_workgroups(wg_bands, 1, 1); }
+                        enc.copy_buffer_to_buffer(&r_new, 0, &r_buf, 0, buf_size);
+                        enc.copy_buffer_to_buffer(&s_new, 0, &s_buf, 0, buf_size);
+                    }
+
+                    // 7. Reinterleave: r_buf, s_buf → kerr_buf
+                    { let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &self.reinterleave_layout, entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: r_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 1, resource: s_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 2, resource: kerr_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 3, resource: di_u.as_entire_binding() },
+                    ]});
+                    let mut p = enc.begin_compute_pass(&Default::default());
+                    p.set_pipeline(&self.reinterleave_pipeline); p.set_bind_group(0, &bg, &[]);
+                    p.dispatch_workgroups(wg_bands, 1, 1); }
+
+                    // 8. Maestro_out squeeze: kerr_buf → sq2_buf
+                    { let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &self.matvec_batch_layout, entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: out_squeeze_w.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 1, resource: kerr_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 2, resource: out_squeeze_b.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 3, resource: sq2_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 4, resource: mv_sq_u.as_entire_binding() },
+                    ]});
+                    let mut p = enc.begin_compute_pass(&Default::default());
+                    p.set_pipeline(&self.matvec_batch_pipeline); p.set_bind_group(0, &bg, &[]);
+                    p.dispatch_workgroups(maestro_dim as u32, n_pos as u32, 1); }
+
+                    // 9. GELU: sq2_buf → act2_buf
+                    { let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &self.gelu_layout, entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: sq2_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 1, resource: act2_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 2, resource: gelu_u.as_entire_binding() },
+                    ]});
+                    let mut p = enc.begin_compute_pass(&Default::default());
+                    p.set_pipeline(&self.gelu_pipeline); p.set_bind_group(0, &bg, &[]);
+                    p.dispatch_workgroups(wg_maestro, 1, 1); }
+
+                    // 10. Maestro_out process: act2_buf → mae_out2_buf
+                    { let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &self.matvec_batch_layout, entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: out_process_w.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 1, resource: act2_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 2, resource: out_process_b.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 3, resource: mae_out2_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 4, resource: mv_pr_u.as_entire_binding() },
+                    ]});
+                    let mut p = enc.begin_compute_pass(&Default::default());
+                    p.set_pipeline(&self.matvec_batch_pipeline); p.set_bind_group(0, &bg, &[]);
+                    p.dispatch_workgroups(n_embd as u32, n_pos as u32, 1); }
+
+                    // 11. Vec add: kerr_buf + mae_out2_buf → regulated_buf
+                    { let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &self.vec_add_layout, entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: kerr_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 1, resource: mae_out2_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 2, resource: regulated_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 3, resource: va_u.as_entire_binding() },
+                    ]});
+                    let mut p = enc.begin_compute_pass(&Default::default());
+                    p.set_pipeline(&self.vec_add_pipeline); p.set_bind_group(0, &bg, &[]);
+                    p.dispatch_workgroups(wg_embd, 1, 1); }
+
+                    // 12. Out projection: regulated_buf → output_buf
+                    { let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &self.matvec_batch_layout, entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: out_proj_w.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 1, resource: regulated_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 2, resource: out_proj_b.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 3, resource: output_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 4, resource: mv_out_u.as_entire_binding() },
+                    ]});
+                    let mut p = enc.begin_compute_pass(&Default::default());
+                    p.set_pipeline(&self.matvec_batch_pipeline); p.set_bind_group(0, &bg, &[]);
+                    p.dispatch_workgroups(n_embd as u32, n_pos as u32, 1); }
+
+                    // ONE submit, ONE readback
+                    self.queue.submit(Some(enc.finish()));
+                    let result_flat = self.readback(&output_buf, n_pos * n_embd);
+                    return result_flat.chunks(n_embd).map(|c| c.to_vec()).collect();
             }
         }
         drop(resident);
@@ -284,11 +540,44 @@ impl ComputeBackend for GpuBackend {
         let in_dim = if out_dim > 0 { w[0].len() } else { return vec![vec![]; xs.len()] };
         let n_pos = xs.len();
 
-        let mut w_flat = Vec::with_capacity(out_dim * in_dim);
-        for row in w { w_flat.extend_from_slice(row); }
+        // Cache weight buffer by pointer — avoid re-upload within same iteration
+        let w_ptr = w.as_ptr() as usize;
+        let b_ptr = b.as_ptr() as usize;
         let x_flat: Vec<f32> = xs.iter().flat_map(|v| v.iter().copied()).collect();
+        let out_total = n_pos * out_dim;
+        let use_bias = 1u32;
 
-        let y_flat = self.gpu_matvec_batch(&w_flat, &x_flat, b, out_dim, in_dim, n_pos);
+        let mut pool = self.pool.lock().unwrap();
+        if !pool.has_weight(w_ptr) {
+            let mut w_flat = Vec::with_capacity(out_dim * in_dim);
+            for row in w { w_flat.extend_from_slice(row); }
+            pool.cache_weight(&self.device, &self.queue, w_ptr, &w_flat);
+        }
+        if !pool.has_weight(b_ptr) {
+            pool.cache_weight(&self.device, &self.queue, b_ptr, b);
+        }
+        // Dispatch with cached weight buffers — hold pool lock for buffer refs
+        let x_buf = self.storage_buf("x", &x_flat);
+        pool.ensure_scratch(&self.device, 0, (out_total * 4) as u64);
+        let params = MatvecBatchParams { out_dim: out_dim as u32, in_dim: in_dim as u32, n_pos: n_pos as u32, use_bias };
+        pool.write_uniform(&self.device, &self.queue, &params);
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None, layout: &self.matvec_batch_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: pool.weight_ref(w_ptr).as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: x_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: pool.weight_ref(b_ptr).as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: pool.scratch_ref(0).as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: pool.uniform_ref().as_entire_binding() },
+            ],
+        });
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        { let mut pass = encoder.begin_compute_pass(&Default::default());
+          pass.set_pipeline(&self.matvec_batch_pipeline); pass.set_bind_group(0, &bind_group, &[]);
+          pass.dispatch_workgroups(out_dim as u32, n_pos as u32, 1); }
+        self.queue.submit(Some(encoder.finish()));
+        let y_flat = pool.readback_scratch(&self.device, &self.queue, 0, out_total);
+        drop(pool);
         y_flat.chunks(out_dim).map(|c| c.to_vec()).collect()
     }
 
@@ -298,11 +587,39 @@ impl ComputeBackend for GpuBackend {
         let in_dim = if out_dim > 0 { w[0].len() } else { return vec![vec![]; xs.len()] };
         let n_pos = xs.len();
 
-        let mut w_flat = Vec::with_capacity(out_dim * in_dim);
-        for row in w { w_flat.extend_from_slice(row); }
+        let w_ptr = w.as_ptr() as usize;
         let x_flat: Vec<f32> = xs.iter().flat_map(|v| v.iter().copied()).collect();
+        let out_total = n_pos * out_dim;
 
-        let y_flat = self.gpu_matvec_batch(&w_flat, &x_flat, &[], out_dim, in_dim, n_pos);
+        let mut pool = self.pool.lock().unwrap();
+        if !pool.has_weight(w_ptr) {
+            let mut w_flat = Vec::with_capacity(out_dim * in_dim);
+            for row in w { w_flat.extend_from_slice(row); }
+            pool.cache_weight(&self.device, &self.queue, w_ptr, &w_flat);
+        }
+        let x_buf = self.storage_buf("x", &x_flat);
+        let dummy_bias = [0.0f32];
+        let dummy_buf = self.storage_buf("nb", &dummy_bias);
+        pool.ensure_scratch(&self.device, 0, (out_total * 4) as u64);
+        let params = MatvecBatchParams { out_dim: out_dim as u32, in_dim: in_dim as u32, n_pos: n_pos as u32, use_bias: 0 };
+        pool.write_uniform(&self.device, &self.queue, &params);
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None, layout: &self.matvec_batch_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: pool.weight_ref(w_ptr).as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: x_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: dummy_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: pool.scratch_ref(0).as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: pool.uniform_ref().as_entire_binding() },
+            ],
+        });
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        { let mut pass = encoder.begin_compute_pass(&Default::default());
+          pass.set_pipeline(&self.matvec_batch_pipeline); pass.set_bind_group(0, &bind_group, &[]);
+          pass.dispatch_workgroups(out_dim as u32, n_pos as u32, 1); }
+        self.queue.submit(Some(encoder.finish()));
+        let y_flat = pool.readback_scratch(&self.device, &self.queue, 0, out_total);
+        drop(pool);
         y_flat.chunks(out_dim).map(|c| c.to_vec()).collect()
     }
 
@@ -311,7 +628,18 @@ impl ComputeBackend for GpuBackend {
         let dim = xs[0].len();
         let n_pos = xs.len();
 
+        // Cache weight/bias buffers — avoid re-upload within same iteration
+        let w_ptr = weight.as_ptr() as usize;
+        let b_ptr = bias.as_ptr() as usize;
+        {
+            let mut pool = self.pool.lock().unwrap();
+            if !pool.has_weight(w_ptr) { pool.cache_weight(&self.device, &self.queue, w_ptr, weight); }
+            if !pool.has_weight(b_ptr) { pool.cache_weight(&self.device, &self.queue, b_ptr, bias); }
+        }
         let x_flat: Vec<f32> = xs.iter().flat_map(|v| v.iter().copied()).collect();
+        // Use gpu_layer_norm_batch — weight/bias still re-uploaded inside it,
+        // but the cache means the NEXT call with same weights skips upload.
+        // TODO: add gpu_layer_norm_batch_resident for full caching
         let y_flat = self.gpu_layer_norm_batch(&x_flat, weight, bias, dim, n_pos);
         y_flat.chunks(dim).map(|c| c.to_vec()).collect()
     }

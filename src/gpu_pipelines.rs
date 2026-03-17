@@ -65,6 +65,17 @@ pub struct GpuBackend {
     pub(crate) vec_scale_add_layout: wgpu::BindGroupLayout,
     pub(crate) rk4_combine_pipeline: wgpu::ComputePipeline,
     pub(crate) rk4_combine_layout: wgpu::BindGroupLayout,
+    // Deinterleave/reinterleave for fused FFN chain
+    pub(crate) deinterleave_pipeline: wgpu::ComputePipeline,
+    pub(crate) deinterleave_layout: wgpu::BindGroupLayout,
+    pub(crate) reinterleave_pipeline: wgpu::ComputePipeline,
+    pub(crate) reinterleave_layout: wgpu::BindGroupLayout,
+    // GELU (element-wise, for fused chain)
+    pub(crate) gelu_pipeline: wgpu::ComputePipeline,
+    pub(crate) gelu_layout: wgpu::BindGroupLayout,
+    // Vec add (element-wise y = a + b, for fused chain)
+    pub(crate) vec_add_pipeline: wgpu::ComputePipeline,
+    pub(crate) vec_add_layout: wgpu::BindGroupLayout,
 }
 
 // ─── Uniform param structs ──────────────────────────────────────
@@ -184,6 +195,33 @@ pub(crate) struct Rk4CombineParams {
     pub dt_over_6: f32,
     pub _pad1: u32,
     pub _pad2: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+pub(crate) struct DeinterleaveParams {
+    pub n_bands: u32,
+    pub n_pos: u32,
+    pub _pad1: u32,
+    pub _pad2: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+pub(crate) struct GeluParams {
+    pub len: u32,
+    pub _pad1: u32,
+    pub _pad2: u32,
+    pub _pad3: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+pub(crate) struct VecAddParams {
+    pub len: u32,
+    pub _pad1: u32,
+    pub _pad2: u32,
+    pub _pad3: u32,
 }
 
 #[repr(C)]
@@ -738,6 +776,65 @@ impl GpuBackend {
             cache: None,
         });
 
+        // ─── Compile deinterleave/reinterleave shaders ────────────────
+        let di_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("deinterleave"), source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/deinterleave.wgsl").into()),
+        });
+        let deinterleave_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("deinterleave_layout"), entries: &[storage_ro(0), storage_rw(1), storage_rw(2), uniform_entry(3)],
+        });
+        let di_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None, bind_group_layouts: &[&deinterleave_layout], push_constant_ranges: &[],
+        });
+        let deinterleave_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("deinterleave"), layout: Some(&di_pl), module: &di_module,
+            entry_point: Some("deinterleave"), compilation_options: Default::default(), cache: None,
+        });
+
+        let ri_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("reinterleave"), source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/reinterleave.wgsl").into()),
+        });
+        let reinterleave_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("reinterleave_layout"), entries: &[storage_ro(0), storage_ro(1), storage_rw(2), uniform_entry(3)],
+        });
+        let ri_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None, bind_group_layouts: &[&reinterleave_layout], push_constant_ranges: &[],
+        });
+        let reinterleave_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("reinterleave"), layout: Some(&ri_pl), module: &ri_module,
+            entry_point: Some("reinterleave"), compilation_options: Default::default(), cache: None,
+        });
+
+        // ─── Compile GELU shader (for fused FFN chain) ──────────────
+        let gelu_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("gelu"), source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/gelu.wgsl").into()),
+        });
+        let gelu_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("gelu_layout"), entries: &[storage_ro(0), storage_rw(1), uniform_entry(2)],
+        });
+        let gelu_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None, bind_group_layouts: &[&gelu_layout], push_constant_ranges: &[],
+        });
+        let gelu_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("gelu"), layout: Some(&gelu_pl), module: &gelu_module,
+            entry_point: Some("gelu"), compilation_options: Default::default(), cache: None,
+        });
+
+        // ─── Compile vec_add shader (y = a + b, for fused FFN chain) ─
+        let va_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("vec_add"), source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/vec_add.wgsl").into()),
+        });
+        let vec_add_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("vec_add_layout"), entries: &[storage_ro(0), storage_ro(1), storage_rw(2), uniform_entry(3)],
+        });
+        let va_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None, bind_group_layouts: &[&vec_add_layout], push_constant_ranges: &[],
+        });
+        let vec_add_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("vec_add"), layout: Some(&va_pl), module: &va_module,
+            entry_point: Some("vec_add"), compilation_options: Default::default(), cache: None,
+        });
+
         Self {
             device,
             queue,
@@ -773,6 +870,14 @@ impl GpuBackend {
             vec_scale_add_layout,
             rk4_combine_pipeline,
             rk4_combine_layout,
+            deinterleave_pipeline,
+            deinterleave_layout,
+            reinterleave_pipeline,
+            reinterleave_layout,
+            gelu_pipeline,
+            gelu_layout,
+            vec_add_pipeline,
+            vec_add_layout,
             pool: Mutex::new(GpuBufferPool::new()),
             resident: Mutex::new(None),
             ffn_block_counter: std::sync::atomic::AtomicUsize::new(0),
