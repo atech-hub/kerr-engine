@@ -759,6 +759,61 @@ impl ComputeBackend for GpuBackend {
         self.readback(&dx_buf, n)
     }
 
+    fn gelu_backward_batch(&self, d_ys: &[Vec<f32>], xs: &[Vec<f32>]) -> Vec<Vec<f32>> {
+        if d_ys.is_empty() { return vec![]; }
+        let dim = d_ys[0].len();
+        let n_pos = d_ys.len();
+        let total = n_pos * dim;
+
+        let dy_flat: Vec<f32> = d_ys.iter().flat_map(|v| v.iter().copied()).collect();
+        let x_flat: Vec<f32> = xs.iter().flat_map(|v| v.iter().copied()).collect();
+        let dy_buf = self.storage_buf("gbb_dy", &dy_flat);
+        let x_buf = self.storage_buf("gbb_x", &x_flat);
+        let dx_buf = self.output_buf("gbb_dx", total);
+        let params = GeluBwdParams { len: total as u32, _pad1: 0, _pad2: 0, _pad3: 0 };
+        let params_buf = self.uniform_buf("gbb_params", &params);
+
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None, layout: &self.gelu_bwd_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: dy_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: x_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: dx_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: params_buf.as_entire_binding() },
+            ],
+        });
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        { let mut pass = encoder.begin_compute_pass(&Default::default());
+          pass.set_pipeline(&self.gelu_bwd_pipeline); pass.set_bind_group(0, &bind_group, &[]);
+          pass.dispatch_workgroups((total as u32 + 63) / 64, 1, 1); }
+        self.queue.submit(Some(encoder.finish()));
+        let result = self.readback(&dx_buf, total);
+        result.chunks(dim).map(|c| c.to_vec()).collect()
+    }
+
+    fn layer_norm_backward_batch(&self, d_ys: &[Vec<f32>], xs: &[Vec<f32>], weight: &[f32]) -> (Vec<Vec<f32>>, Vec<f32>, Vec<f32>) {
+        if d_ys.is_empty() {
+            let dim = weight.len();
+            return (vec![], vec![0.0; dim], vec![0.0; dim]);
+        }
+        let dim = weight.len();
+        let n_pos = d_ys.len();
+        // LN backward shader processes one position per workgroup — dispatch n_pos workgroups
+        // Each writes d_x[dim] + d_weight[dim] + d_bias[dim] = 3*dim outputs
+        // We need to accumulate d_weight and d_bias across positions
+        let mut total_dw = vec![0.0f32; dim];
+        let mut total_db = vec![0.0f32; dim];
+        let mut d_xs = Vec::with_capacity(n_pos);
+        // For now, dispatch per-position on GPU (each is fast, ~1µs at 896-dim)
+        // TODO: write a batched LN backward shader for single-dispatch
+        for pos in 0..n_pos {
+            let (dx, dw, db) = self.layer_norm_backward(&d_ys[pos], &xs[pos], weight);
+            for i in 0..dim { total_dw[i] += dw[i]; total_db[i] += db[i]; }
+            d_xs.push(dx);
+        }
+        (d_xs, total_dw, total_db)
+    }
+
     fn linear_backward_dx_batch(&self, d_y: &[Vec<f32>], w: &[Vec<f32>]) -> Vec<Vec<f32>> {
         let n_pos = d_y.len();
         let out_dim = w.len();

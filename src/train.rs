@@ -235,12 +235,38 @@ pub fn train_with_config(config: TrainConfig) {
 
         let (inputs, targets) = dataset.sample_batch(&mut rng, config.batch_size, config.seq_len);
 
-        // Batched forward+backward: all batch elements in one pass for GPU efficiency.
-        // GPU ops process batch_size * seq_len positions per dispatch (4x more work).
-        // Attention is per-sequence internally (causal mask is sequence-local).
-        let (total_loss, mut grads) = model.forward_backward_batch(
-            &inputs, &targets, active_bands, &*compute_backend,
-        );
+        // Parallel forward+backward across batch elements.
+        // 4 threads submit GPU work concurrently — overlapping submissions keep GPU busy.
+        // Each thread processes seq_len positions independently.
+        let batch_results: Vec<(f32, Vec<f32>)> = thread::scope(|s| {
+            let handles: Vec<_> = (0..config.batch_size).map(|b| {
+                let model_ref = &model;
+                let backend_ref = &*compute_backend;
+                let input_ref = &inputs[b];
+                let target_ref = &targets[b];
+                s.spawn(move || {
+                    let cache = model_ref.forward_with_cache_curriculum(input_ref, active_bands, backend_ref);
+                    let (loss, grads) = model_ref.backward(&cache, target_ref, backend_ref);
+                    let flat_grads = optim::flatten_grads(&grads);
+                    (loss, flat_grads)
+                })
+            }).collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        // Reduce: sum losses and gradients
+        let mut total_loss = 0.0f32;
+        let mut grads = vec![0.0f32; n_params];
+        for (loss, fg) in &batch_results {
+            total_loss += loss;
+            for (a, g) in grads.iter_mut().zip(fg.iter()) {
+                *a += g;
+            }
+        }
+
+        // Average over batch
+        total_loss /= config.batch_size as f32;
+        for g in grads.iter_mut() { *g /= config.batch_size as f32; }
 
         // Gradient clipping
         optim::clip_grad_norm(&mut grads, 1.0);
