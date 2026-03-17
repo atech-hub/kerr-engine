@@ -1,0 +1,2 @@
+Quick NaN detection: add checks after each GPU operation in the forward pass.
+This goes in gpu_dispatch.rs to find exactly which operation produces the first NaN.

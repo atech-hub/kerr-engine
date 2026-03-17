@@ -1,0 +1,194 @@
+warning: unused import: `wgpu::util::DeviceExt`
+ --> src\gpu_pipelines.rs:7:5
+  |
+7 | use wgpu::util::DeviceExt;
+  |     ^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `crate::model::*`
+  --> src\gpu_pipelines.rs:11:5
+   |
+11 | use crate::model::*;
+   |     ^^^^^^^^^^^^^^^
+
+warning: unused import: `crate::init::init_model`
+  --> src\train.rs:11:5
+   |
+11 | use crate::init::init_model;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused variable: `queue`
+   --> src\gpu_buffers.rs:140:59
+    |
+140 |     pub fn cache_weight(&mut self, device: &wgpu::Device, queue: &wgpu::Queue,
+    |                                                           ^^^^^ help: if this is intentional, prefix it with an underscore: `_queue`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `linear_batch_res`
+   --> src\gpu_dispatch.rs:203:13
+    |
+203 | ...   let linear_batch_res = |w_buf: &wgpu::Buffer, b_buf: &wgpu::Buffer, xs: &[Vec<f32>], out_dim: usize, in_dim: usize| -> Vec<Ve...
+    |           ^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_linear_batch_res`
+
+warning: unused variable: `r_tmp`
+   --> src\gpu_dispatch.rs:239:25
+    |
+239 |                     let r_tmp = &sc.r_tmp;
+    |                         ^^^^^ help: if this is intentional, prefix it with an underscore: `_r_tmp`
+
+warning: unused variable: `s_tmp`
+   --> src\gpu_dispatch.rs:240:25
+    |
+240 |                     let s_tmp = &sc.s_tmp;
+    |                         ^^^^^ help: if this is intentional, prefix it with an underscore: `_s_tmp`
+
+warning: methods `gpu_matvec_batch` and `gpu_kerr_ode_batch` are never used
+   --> src\gpu_ops_forward.rs:250:19
+    |
+ 12 | impl GpuBackend {
+    | --------------- methods in this implementation
+...
+250 |     pub(crate) fn gpu_matvec_batch(&self, w_flat: &[f32], x_flat: &[f32], b: &[f32], out_dim: usize, in_dim: usize, n_pos: usize) -...
+    |                   ^^^^^^^^^^^^^^^^
+...
+616 |     pub(crate) fn gpu_kerr_ode_batch(&self, weights: &KerrWeights, xs: &[Vec<f32>]) -> Vec<Vec<f32>> {
+    |                   ^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `kerr-engine` (lib) generated 8 warnings (run `cargo fix --lib -p kerr-engine` to apply 7 suggestions)
+warning: function `load_with_config` is never used
+  --> src\checkpoint.rs:74:8
+   |
+74 | pub fn load_with_config(path: &str, fallback: ModelConfig) -> io::Result<TrainingState> {
+   |        ^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `linear_backward` is never used
+  --> src\backward.rs:14:8
+   |
+14 | pub fn linear_backward(
+   |        ^^^^^^^^^^^^^^^
+
+warning: function `maestro_backward` is never used
+   --> src\backward.rs:519:8
+    |
+519 | pub fn maestro_backward(
+    |        ^^^^^^^^^^^^^^^^
+
+warning: struct `LinearGrads` is never constructed
+   --> src\backward.rs:550:12
+    |
+550 | pub struct LinearGrads {
+    |            ^^^^^^^^^^^
+
+warning: method `cached_count` is never used
+   --> src\gpu_buffers.rs:163:12
+    |
+ 34 | impl GpuBufferPool {
+    | ------------------ method in this implementation
+...
+163 |     pub fn cached_count(&self) -> usize {
+    |            ^^^^^^^^^^^^
+
+warning: methods `gpu_matvec_batch` and `gpu_kerr_ode_batch` are never used
+   --> src\gpu_ops_forward.rs:250:19
+    |
+ 12 | impl GpuBackend {
+    | --------------- methods in this implementation
+...
+250 |     pub(crate) fn gpu_matvec_batch(&self, w_flat: &[f32], x_flat: &[f32], b: &[f32], out_dim: usize, in_dim: usize, n_pos: usize) -...
+    |                   ^^^^^^^^^^^^^^^^
+...
+616 |     pub(crate) fn gpu_kerr_ode_batch(&self, weights: &KerrWeights, xs: &[Vec<f32>]) -> Vec<Vec<f32>> {
+    |                   ^^^^^^^^^^^^^^^^^^
+
+warning: fields `matvec_bwd_pipeline` and `matvec_bwd_layout` are never read
+  --> src\gpu_pipelines.rs:32:16
+   |
+15 | pub struct GpuBackend {
+   |            ---------- fields in this struct
+...
+32 |     pub(crate) matvec_bwd_pipeline: wgpu::ComputePipeline,
+   |                ^^^^^^^^^^^^^^^^^^^
+33 |     pub(crate) matvec_bwd_layout: wgpu::BindGroupLayout,
+   |                ^^^^^^^^^^^^^^^^^
+
+warning: method `invalidate_weight_cache` is never used
+   --> src\gpu_pipelines.rs:888:12
+    |
+277 | impl GpuBackend {
+    | --------------- method in this implementation
+...
+888 |     pub fn invalidate_weight_cache(&self) {
+    |            ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: methods `kerr_maestro_add`, `kerr_dual_maestro_forward`, and `extract_ode_states` are never used
+   --> src\model.rs:460:12
+    |
+264 | impl ModelWeights {
+    | ----------------- methods in this implementation
+...
+460 |     pub fn kerr_maestro_add(&self, weights: &KerrMaestroAddWeights, x: &[Vec<f32>]) -> Vec<Vec<f32>> {
+    |            ^^^^^^^^^^^^^^^^
+...
+496 |     pub fn kerr_dual_maestro_forward(
+    |            ^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+597 |     pub fn extract_ode_states(
+    |            ^^^^^^^^^^^^^^^^^^
+
+warning: method `set_lr` is never used
+  --> src\optim.rs:21:12
+   |
+19 | impl Adam {
+   | --------- method in this implementation
+20 |     /// Set learning rate (for transition lr schedule).
+21 |     pub fn set_lr(&mut self, lr: f32) { self.lr = lr; }
+   |            ^^^^^^
+
+warning: method `forward_backward_batch` is never used
+   --> src\pipeline.rs:764:12
+    |
+168 | impl ModelWeights {
+    | ----------------- method in this implementation
+...
+764 |     pub fn forward_backward_batch(
+    |            ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `lr_multiplier` is never used
+  --> src\train.rs:75:12
+   |
+27 | impl CurriculumSchedule {
+   | ----------------------- method in this implementation
+...
+75 |     pub fn lr_multiplier(&self, iter: usize, n_iters: usize, margin: usize) -> f32 {
+   |            ^^^^^^^^^^^^^
+
+warning: `kerr-engine` (bin "kerr-engine") generated 19 warnings (7 duplicates)
+    Finished `release` profile [optimized] target(s) in 0.07s
+     Running `target\release\kerr-engine.exe train data/input.txt 1000 4 64 1e-4 --dual-maestro --n-bands 448 --n-head 14 --gpu --seed 42 --rk4-steps 16 --threads 4 --no-curriculum`
+kerr-engine v0.2.0
+
+Stage 4 — training from scratch
+
+Loading dataset from data/input.txt...
+  Dataset [char]: 1115394 tokens (train=1003854, val=111540), vocab_size=65
+Initializing model (seed=42, dual-maestro)...
+  Trainable parameters: 16331494
+  GPU: NVIDIA GeForce RTX 4070 Ti (Vulkan)
+  GPU adapter: NVIDIA GeForce RTX 4070 Ti
+  Backend:     Vulkan
+  Precision: tiled workgroup reduction (stable at 768-dim+)
+  Backend: GPU (n_embd=896 >= 768 crossover)
+  Curriculum: 448 bands (0-1000)
+
+Training for 1000 iterations (batch_size=4, seq_len=64, lr=0.0001, threads=4)
+  Iter       Loss  Bands       Time
+----------------------------------------
+     0     4.3389    448       1.3s
+    50     3.0395    448       1.4s
+error: process didn't exit successfully: `target\release\kerr-engine.exe train data/input.txt 1000 4 64 1e-4 --dual-maestro --n-bands 448 --n-head 14 --gpu --seed 42 --rk4-steps 16 --threads 4 --no-curriculum` (exit code: 1)
